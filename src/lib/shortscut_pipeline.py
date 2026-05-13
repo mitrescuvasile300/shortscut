@@ -682,36 +682,73 @@ def analyze_transcript(api_key: str, transcript: dict, video_title: str,
 def detect_faces_for_clip(python_path: str, video_path: Path,
                           start_time: float, duration: float,
                           src_w: int, src_h: int, crop_w: int) -> dict:
-    """Detect face positions using mediapipe.
+    """Detect face positions using mediapipe + OpenCV Haar cascade fallback.
+    Uses ffmpeg for reliable frame extraction (no cv2 seeking issues).
     Returns dict with:
       - mode: "single" | "dual" | "center"
       - crop_x: int (for single/center mode)
       - face1_x, face2_x: float (for dual mode, normalized 0-1)
     """
+    # Extract sample frames using ffmpeg (much more reliable than cv2 seeking)
+    tmp_frames_dir = Path(video_path).parent / ".face_frames"
+    tmp_frames_dir.mkdir(exist_ok=True)
+
+    # Clean old frames
+    for f in tmp_frames_dir.glob("*.jpg"):
+        f.unlink()
+
+    # Extract 15 frames spread across the clip
+    samples = [i / 16 for i in range(1, 16)]
+    frame_paths = []
+    for idx, frac in enumerate(samples):
+        t = start_time + duration * frac
+        frame_path = tmp_frames_dir / f"frame_{idx:02d}.jpg"
+        subprocess.run(
+            ["ffmpeg", "-y", "-ss", str(t), "-i", str(video_path),
+             "-vframes", "1", "-q:v", "2", str(frame_path)],
+            capture_output=True, timeout=30,
+        )
+        if frame_path.exists():
+            frame_paths.append(str(frame_path))
+
+    if not frame_paths:
+        print(f"    ⚠️  Could not extract any frames")
+        return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
+
+    # Run face detection in subprocess (mediapipe + Haar cascade fallback)
+    frame_paths_json = json.dumps(frame_paths)
     face_script = textwrap.dedent(f"""\
-        import json, sys, statistics
+        import json, sys, statistics, os
+        frame_paths = {frame_paths_json}
+        src_w = {src_w}
+        src_h = {src_h}
+
+        def log(msg):
+            print(f"DIAG: {{msg}}", file=sys.stderr)
+
+        xs = []
+
+        # ── METHOD 1: MediaPipe face detection ──
+        mp_ok = False
         try:
             import cv2
             import mediapipe as mp
-            # Use BOTH model_selection=0 (short-range, <2m) and 1 (full-range, <5m)
-            # Lower confidence threshold for varied camera angles/lighting
+            mp_ok = True
+            log(f"MediaPipe {{mp.__version__}} + OpenCV {{cv2.__version__}} loaded")
+
             detectors = [
                 mp.solutions.face_detection.FaceDetection(
-                    model_selection=0, min_detection_confidence=0.35),
+                    model_selection=0, min_detection_confidence=0.3),
                 mp.solutions.face_detection.FaceDetection(
-                    model_selection=1, min_detection_confidence=0.35),
+                    model_selection=1, min_detection_confidence=0.3),
             ]
-            cap = cv2.VideoCapture('{video_path}')
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            # Sample 15 frames spread across the clip
-            samples = [i/16 for i in range(1, 16)]
-            xs = []
-            for frac in samples:
-                ft = {start_time} + {duration} * frac
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(ft * fps))
-                ret, frame = cap.read()
-                if not ret: continue
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            for fp in frame_paths:
+                img = cv2.imread(fp)
+                if img is None:
+                    log(f"  Cannot read {{fp}}")
+                    continue
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 frame_xs = []
                 for fd in detectors:
                     res = fd.process(rgb)
@@ -719,55 +756,142 @@ def detect_faces_for_clip(python_path: str, video_path: Path,
                         for d in res.detections:
                             b = d.location_data.relative_bounding_box
                             cx = b.xmin + b.width / 2
-                            # Accept any reasonably-sized face
-                            if b.width > 0.03 and b.height > 0.03:
+                            score = d.score[0]
+                            if b.width > 0.02 and b.height > 0.02:
                                 frame_xs.append(cx)
+                                log(f"  MP face: x={{cx:.3f}} w={{b.width:.3f}} h={{b.height:.3f}} score={{score:.3f}}")
                 if frame_xs:
-                    # Deduplicate: if multiple detectors found same face, take median
                     xs.append(statistics.median(frame_xs))
-            cap.release()
+
             for fd in detectors:
                 fd.close()
-            if xs:
-                xs.sort()
-                clusters, cur = [], [xs[0]]
-                for x in xs[1:]:
-                    if abs(x - cur[-1]) < 0.15:
-                        cur.append(x)
-                    else:
-                        clusters.append(cur)
-                        cur = [x]
-                clusters.append(cur)
-                # Pick the largest cluster (most consistent face position)
-                clusters.sort(key=len, reverse=True)
-                if len(clusters) == 1 or len(clusters[0]) > len(clusters[1]) * 2:
-                    # Single dominant face — use median for robustness
-                    cx = statistics.median(clusters[0])
-                    print(json.dumps({{"mode": "single", "x": cx, "n": len(clusters[0])}}))
-                elif len(clusters) >= 2:
-                    c1 = statistics.median(clusters[0])
-                    c2 = statistics.median(clusters[1])
-                    cf = {crop_w}/{src_w}
-                    if abs(c1-c2) < cf * 0.8:
-                        # Both fit in one crop with margin
-                        print(json.dumps({{"mode": "single", "x": (c1+c2)/2, "n": len(clusters[0])+len(clusters[1])}}))
-                    else:
-                        # Two faces too far apart → dual mode
-                        print(json.dumps({{"mode": "dual", "face1_x": min(c1,c2), "face2_x": max(c1,c2)}}))
-            else:
-                print(json.dumps({{"mode": "center"}}))
+
+            log(f"MediaPipe found {{len(xs)}} face positions from {{len(frame_paths)}} frames")
         except Exception as e:
-            print(json.dumps({{"mode": "center", "err": str(e)}}))
+            log(f"MediaPipe failed: {{e}}")
+
+        # ── METHOD 2: OpenCV Haar cascade fallback ──
+        if len(xs) < 3:
+            log("Trying Haar cascade fallback...")
+            try:
+                import cv2
+                # Find Haar cascade file
+                cascade_path = None
+                for p in [
+                    cv2.data.haarcascades + "haarcascade_frontalface_default.xml",
+                    cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml",
+                    "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
+                ]:
+                    if os.path.exists(p):
+                        cascade_path = p
+                        break
+
+                if cascade_path:
+                    face_cascade = cv2.CascadeClassifier(cascade_path)
+                    log(f"  Using Haar cascade: {{cascade_path}}")
+                    haar_xs = []
+                    for fp in frame_paths:
+                        img = cv2.imread(fp)
+                        if img is None:
+                            continue
+                        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                        gray = cv2.equalizeHist(gray)
+                        faces = face_cascade.detectMultiScale(
+                            gray, scaleFactor=1.05, minNeighbors=3,
+                            minSize=(int(src_w*0.03), int(src_h*0.03)))
+                        for (x, y, w, h) in faces:
+                            cx = (x + w/2) / src_w
+                            log(f"  Haar face: x={{cx:.3f}} w={{w/src_w:.3f}} h={{h/src_h:.3f}}")
+                            haar_xs.append(cx)
+                    if haar_xs:
+                        xs = haar_xs  # use Haar results since MP failed
+                        log(f"Haar cascade found {{len(haar_xs)}} detections")
+                    else:
+                        log("Haar cascade also found nothing")
+                else:
+                    log("No Haar cascade XML found")
+            except Exception as e:
+                log(f"Haar cascade error: {{e}}")
+
+        # ── METHOD 3: Edge/brightness analysis as last resort ──
+        if len(xs) < 2:
+            log("Trying brightness analysis fallback...")
+            try:
+                import cv2
+                bright_xs = []
+                for fp in frame_paths[:5]:
+                    img = cv2.imread(fp)
+                    if img is None:
+                        continue
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    h_img, w_img = gray.shape
+                    # Divide into 10 vertical strips, find the brightest/highest-contrast one
+                    strip_w = w_img // 10
+                    strip_scores = []
+                    for s in range(10):
+                        strip = gray[:, s*strip_w:(s+1)*strip_w]
+                        # Use Laplacian variance (edge density) as proxy for "person is here"
+                        lap = cv2.Laplacian(strip, cv2.CV_64F)
+                        score = lap.var()
+                        strip_scores.append(score)
+                    # The strip with most edges is likely where the person stands
+                    best_strip = max(range(10), key=lambda i: strip_scores[i])
+                    cx = (best_strip + 0.5) / 10
+                    log(f"  Brightness best strip: {{best_strip}} (x={{cx:.2f}}), scores={{[f'{{s:.0f}}' for s in strip_scores]}}")
+                    bright_xs.append(cx)
+                if bright_xs:
+                    xs = bright_xs
+                    log(f"Brightness analysis found subject around x={{statistics.median(bright_xs):.3f}}")
+            except Exception as e:
+                log(f"Brightness analysis error: {{e}}")
+
+        # ── Cluster and output result ──
+        if xs:
+            xs.sort()
+            clusters, cur = [], [xs[0]]
+            for x in xs[1:]:
+                if abs(x - cur[-1]) < 0.15:
+                    cur.append(x)
+                else:
+                    clusters.append(cur)
+                    cur = [x]
+            clusters.append(cur)
+            clusters.sort(key=len, reverse=True)
+            if len(clusters) == 1 or len(clusters[0]) >= len(clusters[1]) * 2:
+                cx = statistics.median(clusters[0])
+                print(json.dumps({{"mode": "single", "x": cx, "n": len(clusters[0])}}))
+            elif len(clusters) >= 2:
+                c1 = statistics.median(clusters[0])
+                c2 = statistics.median(clusters[1])
+                cf = {crop_w}/{src_w}
+                if abs(c1-c2) < cf * 0.8:
+                    print(json.dumps({{"mode": "single", "x": (c1+c2)/2, "n": len(clusters[0])+len(clusters[1])}}))
+                else:
+                    print(json.dumps({{"mode": "dual", "face1_x": min(c1,c2), "face2_x": max(c1,c2)}}))
+        else:
+            print(json.dumps({{"mode": "center"}}))
     """)
 
     r = subprocess.run(
         [python_path, "-c", face_script],
         capture_output=True, text=True, timeout=120,
     )
+
+    # Print diagnostics from stderr
+    if r.stderr:
+        for line in r.stderr.strip().split("\n"):
+            if line.startswith("DIAG:"):
+                print(f"    {line[5:].strip()}")
+
     try:
         data = json.loads(r.stdout.strip().split("\n")[-1])
     except Exception:
+        print(f"    ⚠️  Face detect parse error. stdout={r.stdout[:200]}, stderr={r.stderr[:200]}")
         data = {"mode": "center"}
+
+    # Clean up frames
+    import shutil
+    shutil.rmtree(tmp_frames_dir, ignore_errors=True)
 
     mode = data.get("mode", "center")
 
