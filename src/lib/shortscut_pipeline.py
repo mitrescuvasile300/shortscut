@@ -22,6 +22,7 @@ import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -682,202 +683,152 @@ def analyze_transcript(api_key: str, transcript: dict, video_title: str,
 def detect_faces_for_clip(python_path: str, video_path: Path,
                           start_time: float, duration: float,
                           src_w: int, src_h: int, crop_w: int) -> dict:
-    """Detect face positions using mediapipe + OpenCV Haar cascade fallback.
-    Uses ffmpeg for reliable frame extraction (no cv2 seeking issues).
-    Returns dict with:
-      - mode: "single" | "dual" | "center"
-      - crop_x: int (for single/center mode)
-      - face1_x, face2_x: float (for dual mode, normalized 0-1)
+    """Detect and TRACK face positions throughout the clip for dynamic crop.
+    Uses ffmpeg fps filter for frame extraction + MediaPipe/Haar cascade.
+    Returns:
+      - {"mode": "tracking", "keyframes": [(t, crop_x), ...]} for dynamic face-following
+      - {"mode": "single", "crop_x": int} for static crop
+      - {"mode": "dual", "face1_x": float, "face2_x": float} for split-screen
+      - {"mode": "center", "crop_x": int} for fallback
     """
-    # Extract sample frames using ffmpeg (much more reliable than cv2 seeking)
+    # Extract frames at 2fps using ffmpeg (single fast command, reliable on all codecs)
     tmp_frames_dir = Path(video_path).parent / ".face_frames"
+    if tmp_frames_dir.exists():
+        shutil.rmtree(tmp_frames_dir)
     tmp_frames_dir.mkdir(exist_ok=True)
 
-    # Clean old frames
-    for f in tmp_frames_dir.glob("*.jpg"):
-        f.unlink()
+    # Use fps filter to extract exactly 2 frames per second
+    extract_fps = 2 if duration <= 90 else 1  # lower rate for very long clips
+    subprocess.run([
+        "ffmpeg", "-y", "-ss", str(start_time), "-t", str(duration),
+        "-i", str(video_path),
+        "-vf", f"fps={extract_fps}", "-q:v", "3",
+        str(tmp_frames_dir / "frame_%04d.jpg")
+    ], capture_output=True, timeout=180)
 
-    # Extract 15 frames spread across the clip
-    samples = [i / 16 for i in range(1, 16)]
-    frame_paths = []
-    for idx, frac in enumerate(samples):
-        t = start_time + duration * frac
-        frame_path = tmp_frames_dir / f"frame_{idx:02d}.jpg"
-        subprocess.run(
-            ["ffmpeg", "-y", "-ss", str(t), "-i", str(video_path),
-             "-vframes", "1", "-q:v", "2", str(frame_path)],
-            capture_output=True, timeout=30,
-        )
-        if frame_path.exists():
-            frame_paths.append(str(frame_path))
+    frame_paths = sorted(tmp_frames_dir.glob("frame_*.jpg"))
+    frame_interval = 1.0 / extract_fps  # seconds between frames
 
     if not frame_paths:
         print(f"    ⚠️  Could not extract any frames")
+        shutil.rmtree(tmp_frames_dir, ignore_errors=True)
         return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
 
-    # Run face detection in subprocess (mediapipe + Haar cascade fallback)
-    frame_paths_json = json.dumps(frame_paths)
+    frame_paths_json = json.dumps([str(p) for p in frame_paths])
+
+    # Run face detection on ALL frames in subprocess
     face_script = textwrap.dedent(f"""\
-        import json, sys, statistics, os
-        frame_paths = {frame_paths_json}
-        src_w = {src_w}
-        src_h = {src_h}
+import json, sys, os, statistics
 
-        def log(msg):
-            print(f"DIAG: {{msg}}", file=sys.stderr)
+frame_paths = {frame_paths_json}
+src_w = {src_w}
+src_h = {src_h}
 
-        xs = []
+def log(msg):
+    print(f"DIAG: {{msg}}", file=sys.stderr)
 
-        # ── METHOD 1: MediaPipe face detection ──
-        mp_ok = False
-        try:
-            import cv2
-            import mediapipe as mp
-            mp_ok = True
-            log(f"MediaPipe {{mp.__version__}} + OpenCV {{cv2.__version__}} loaded")
+# Per-frame results: list of face_x_normalized or None
+results = [None] * len(frame_paths)
 
-            detectors = [
-                mp.solutions.face_detection.FaceDetection(
-                    model_selection=0, min_detection_confidence=0.3),
-                mp.solutions.face_detection.FaceDetection(
-                    model_selection=1, min_detection_confidence=0.3),
-            ]
+# ── METHOD 1: MediaPipe face detection ──
+mp_count = 0
+try:
+    import cv2
+    import mediapipe as mp
+    log(f"MediaPipe {{mp.__version__}} + OpenCV {{cv2.__version__}}, {{len(frame_paths)}} frames")
 
-            for fp in frame_paths:
-                img = cv2.imread(fp)
-                if img is None:
-                    log(f"  Cannot read {{fp}}")
-                    continue
-                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                frame_xs = []
-                for fd in detectors:
-                    res = fd.process(rgb)
-                    if res.detections:
-                        for d in res.detections:
-                            b = d.location_data.relative_bounding_box
-                            cx = b.xmin + b.width / 2
-                            score = d.score[0]
-                            if b.width > 0.02 and b.height > 0.02:
-                                frame_xs.append(cx)
-                                log(f"  MP face: x={{cx:.3f}} w={{b.width:.3f}} h={{b.height:.3f}} score={{score:.3f}}")
-                if frame_xs:
-                    xs.append(statistics.median(frame_xs))
+    detectors = [
+        mp.solutions.face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.3),
+        mp.solutions.face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.3),
+    ]
 
-            for fd in detectors:
-                fd.close()
+    for idx, fp in enumerate(frame_paths):
+        img = cv2.imread(fp)
+        if img is None:
+            continue
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        frame_xs = []
+        for fd in detectors:
+            res = fd.process(rgb)
+            if res.detections:
+                for d in res.detections:
+                    b = d.location_data.relative_bounding_box
+                    if b.width > 0.02 and b.height > 0.02:
+                        frame_xs.append(b.xmin + b.width / 2)
+        if frame_xs:
+            results[idx] = statistics.median(frame_xs)
+            mp_count += 1
 
-            log(f"MediaPipe found {{len(xs)}} face positions from {{len(frame_paths)}} frames")
-        except Exception as e:
-            log(f"MediaPipe failed: {{e}}")
+    for fd in detectors:
+        fd.close()
+    log(f"MediaPipe: {{mp_count}}/{{len(frame_paths)}} frames")
+except Exception as e:
+    log(f"MediaPipe error: {{e}}")
 
-        # ── METHOD 2: OpenCV Haar cascade fallback ──
-        if len(xs) < 3:
-            log("Trying Haar cascade fallback...")
-            try:
-                import cv2
-                # Find Haar cascade file
-                cascade_path = None
-                for p in [
-                    cv2.data.haarcascades + "haarcascade_frontalface_default.xml",
-                    cv2.data.haarcascades + "haarcascade_frontalface_alt2.xml",
-                    "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
-                ]:
-                    if os.path.exists(p):
-                        cascade_path = p
-                        break
+# ── METHOD 2: Haar cascade fallback for frames where MP failed ──
+haar_count = 0
+try:
+    import cv2
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    if os.path.exists(cascade_path):
+        face_cascade = cv2.CascadeClassifier(cascade_path)
+        for idx, fp in enumerate(frame_paths):
+            if results[idx] is not None:
+                continue
+            img = cv2.imread(fp)
+            if img is None:
+                continue
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = cv2.equalizeHist(gray)
+            faces = face_cascade.detectMultiScale(gray, 1.05, 3,
+                minSize=(int(src_w * 0.03), int(src_h * 0.03)))
+            if len(faces) > 0:
+                areas = [w * h for (x, y, w, h) in faces]
+                best = faces[areas.index(max(areas))]
+                results[idx] = (best[0] + best[2] / 2) / src_w
+                haar_count += 1
+        if haar_count:
+            log(f"Haar: filled {{haar_count}} more frames")
+except Exception as e:
+    log(f"Haar error: {{e}}")
 
-                if cascade_path:
-                    face_cascade = cv2.CascadeClassifier(cascade_path)
-                    log(f"  Using Haar cascade: {{cascade_path}}")
-                    haar_xs = []
-                    for fp in frame_paths:
-                        img = cv2.imread(fp)
-                        if img is None:
-                            continue
-                        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                        gray = cv2.equalizeHist(gray)
-                        faces = face_cascade.detectMultiScale(
-                            gray, scaleFactor=1.05, minNeighbors=3,
-                            minSize=(int(src_w*0.03), int(src_h*0.03)))
-                        for (x, y, w, h) in faces:
-                            cx = (x + w/2) / src_w
-                            log(f"  Haar face: x={{cx:.3f}} w={{w/src_w:.3f}} h={{h/src_h:.3f}}")
-                            haar_xs.append(cx)
-                    if haar_xs:
-                        xs = haar_xs  # use Haar results since MP failed
-                        log(f"Haar cascade found {{len(haar_xs)}} detections")
-                    else:
-                        log("Haar cascade also found nothing")
-                else:
-                    log("No Haar cascade XML found")
-            except Exception as e:
-                log(f"Haar cascade error: {{e}}")
+# ── METHOD 3: Edge analysis for remaining gaps ──
+edge_count = 0
+try:
+    import cv2
+    for idx, fp in enumerate(frame_paths):
+        if results[idx] is not None:
+            continue
+        img = cv2.imread(fp)
+        if img is None:
+            continue
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        h_img, w_img = gray.shape
+        strip_w = w_img // 10
+        scores = []
+        for s in range(10):
+            strip = gray[:, s * strip_w:(s + 1) * strip_w]
+            lap = cv2.Laplacian(strip, cv2.CV_64F)
+            scores.append(lap.var())
+        best = max(range(10), key=lambda i: scores[i])
+        results[idx] = (best + 0.5) / 10
+        edge_count += 1
+    if edge_count:
+        log(f"Edge analysis: filled {{edge_count}} more frames")
+except Exception as e:
+    log(f"Edge error: {{e}}")
 
-        # ── METHOD 3: Edge/brightness analysis as last resort ──
-        if len(xs) < 2:
-            log("Trying brightness analysis fallback...")
-            try:
-                import cv2
-                bright_xs = []
-                for fp in frame_paths[:5]:
-                    img = cv2.imread(fp)
-                    if img is None:
-                        continue
-                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                    h_img, w_img = gray.shape
-                    # Divide into 10 vertical strips, find the brightest/highest-contrast one
-                    strip_w = w_img // 10
-                    strip_scores = []
-                    for s in range(10):
-                        strip = gray[:, s*strip_w:(s+1)*strip_w]
-                        # Use Laplacian variance (edge density) as proxy for "person is here"
-                        lap = cv2.Laplacian(strip, cv2.CV_64F)
-                        score = lap.var()
-                        strip_scores.append(score)
-                    # The strip with most edges is likely where the person stands
-                    best_strip = max(range(10), key=lambda i: strip_scores[i])
-                    cx = (best_strip + 0.5) / 10
-                    log(f"  Brightness best strip: {{best_strip}} (x={{cx:.2f}}), scores={{[f'{{s:.0f}}' for s in strip_scores]}}")
-                    bright_xs.append(cx)
-                if bright_xs:
-                    xs = bright_xs
-                    log(f"Brightness analysis found subject around x={{statistics.median(bright_xs):.3f}}")
-            except Exception as e:
-                log(f"Brightness analysis error: {{e}}")
-
-        # ── Cluster and output result ──
-        if xs:
-            xs.sort()
-            clusters, cur = [], [xs[0]]
-            for x in xs[1:]:
-                if abs(x - cur[-1]) < 0.15:
-                    cur.append(x)
-                else:
-                    clusters.append(cur)
-                    cur = [x]
-            clusters.append(cur)
-            clusters.sort(key=len, reverse=True)
-            if len(clusters) == 1 or len(clusters[0]) >= len(clusters[1]) * 2:
-                cx = statistics.median(clusters[0])
-                print(json.dumps({{"mode": "single", "x": cx, "n": len(clusters[0])}}))
-            elif len(clusters) >= 2:
-                c1 = statistics.median(clusters[0])
-                c2 = statistics.median(clusters[1])
-                cf = {crop_w}/{src_w}
-                if abs(c1-c2) < cf * 0.8:
-                    print(json.dumps({{"mode": "single", "x": (c1+c2)/2, "n": len(clusters[0])+len(clusters[1])}}))
-                else:
-                    print(json.dumps({{"mode": "dual", "face1_x": min(c1,c2), "face2_x": max(c1,c2)}}))
-        else:
-            print(json.dumps({{"mode": "center"}}))
-    """)
+detected = sum(1 for r in results if r is not None)
+log(f"Total: {{detected}}/{{len(results)}} frames with position")
+print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge": edge_count}}))
+""")
 
     r = subprocess.run(
         [python_path, "-c", face_script],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True, text=True, timeout=300,
     )
 
-    # Print diagnostics from stderr
+    # Print diagnostics
     if r.stderr:
         for line in r.stderr.strip().split("\n"):
             if line.startswith("DIAG:"):
@@ -886,33 +837,119 @@ def detect_faces_for_clip(python_path: str, video_path: Path,
     try:
         data = json.loads(r.stdout.strip().split("\n")[-1])
     except Exception:
-        print(f"    ⚠️  Face detect parse error. stdout={r.stdout[:200]}, stderr={r.stderr[:200]}")
-        data = {"mode": "center"}
+        print(f"    ⚠️  Face detect parse error. stderr={r.stderr[:300]}")
+        shutil.rmtree(tmp_frames_dir, ignore_errors=True)
+        return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
 
-    # Clean up frames
-    import shutil
     shutil.rmtree(tmp_frames_dir, ignore_errors=True)
 
-    mode = data.get("mode", "center")
+    raw = data.get("results", [])
+    n_detected = sum(1 for r in raw if r is not None)
 
-    if mode == "dual":
-        return {
-            "mode": "dual",
-            "face1_x": data["face1_x"],
-            "face2_x": data["face2_x"],
-        }
-    elif mode == "single":
-        face_x = data.get("x")
-        if face_x is not None:
-            # Center crop on face, but bias slightly left of face center
-            # (in stand-up comedy, body extends below/around the face)
-            # This keeps the person comfortably centered, not at the edge
-            crop_x = int(face_x * src_w - crop_w * 0.45)  # face at 45% from left edge
-            crop_x = max(0, min(crop_x, src_w - crop_w))
-            return {"mode": "single", "crop_x": crop_x,
-                    "face_x_norm": face_x, "detections": data.get("n", 0)}
+    if n_detected < 2:
+        print(f"    ⚠️  Only {n_detected} face detections — using center")
+        return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
 
-    return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
+    # ── Fill gaps by nearest-neighbor interpolation ──
+    filled = list(raw)
+    last_good = None
+    for i in range(len(filled)):
+        if filled[i] is not None:
+            last_good = filled[i]
+        elif last_good is not None:
+            filled[i] = last_good
+    last_good = None
+    for i in range(len(filled) - 1, -1, -1):
+        if filled[i] is not None:
+            last_good = filled[i]
+        elif last_good is not None:
+            filled[i] = last_good
+
+    if any(v is None for v in filled):
+        return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
+
+    # ── Check for dual-face scenario ──
+    vals_sorted = sorted(filled)
+    clusters, cur = [], [vals_sorted[0]]
+    for v in vals_sorted[1:]:
+        if abs(v - cur[-1]) < 0.15:
+            cur.append(v)
+        else:
+            clusters.append(cur)
+            cur = [v]
+    clusters.append(cur)
+    if len(clusters) >= 2:
+        c1 = statistics.median(clusters[0])
+        c2 = statistics.median(clusters[1])
+        if abs(c1 - c2) > (crop_w / src_w) * 0.8:
+            return {"mode": "dual", "face1_x": min(c1, c2), "face2_x": max(c1, c2)}
+
+    # ── Smooth with moving average (window = 2.5 seconds) ──
+    window = max(3, int(2.5 / frame_interval))
+    smoothed = []
+    for i in range(len(filled)):
+        s = max(0, i - window // 2)
+        e = min(len(filled), i + window // 2 + 1)
+        smoothed.append(sum(filled[s:e]) / (e - s))
+
+    # ── Convert to pixel crop positions ──
+    max_crop_x = src_w - crop_w
+    crop_positions = []
+    for x_norm in smoothed:
+        cx = int(x_norm * src_w - crop_w * 0.45)
+        cx = max(0, min(cx, max_crop_x))
+        crop_positions.append(cx)
+
+    # ── Reduce to keyframes (position changes > 15px) ──
+    keyframes = [(0.0, crop_positions[0])]
+    for i in range(1, len(crop_positions)):
+        t = i * frame_interval
+        if abs(crop_positions[i] - keyframes[-1][1]) > 15 or i == len(crop_positions) - 1:
+            keyframes.append((t, crop_positions[i]))
+
+    # If nearly static (range < 20px), use simple single mode
+    min_x = min(kf[1] for kf in keyframes)
+    max_x_val = max(kf[1] for kf in keyframes)
+    if max_x_val - min_x < 20:
+        avg_x = int(statistics.mean([kf[1] for kf in keyframes]))
+        avg_x = max(0, min(avg_x, max_crop_x))
+        return {"mode": "single", "crop_x": avg_x, "detections": n_detected}
+
+    print(f"    📹 Tracking: {len(keyframes)} keyframes, x range {min_x}-{max_x_val}px")
+    return {"mode": "tracking", "keyframes": keyframes}
+
+
+def build_tracking_crop_expr(keyframes: list, max_crop_x: int) -> str:
+    """Build ffmpeg crop x expression for dynamic face tracking.
+    keyframes: list of (time_in_seconds, crop_x_pixels).
+    Returns escaped expression string for use in ffmpeg -vf crop filter.
+    Commas are escaped as \\, for ffmpeg filter-graph parsing.
+    """
+    if len(keyframes) <= 1:
+        return str(int(keyframes[0][1]) if keyframes else max_crop_x // 2)
+
+    # Build nested if() with piecewise linear interpolation
+    expr = str(int(round(keyframes[-1][1])))
+    for i in range(len(keyframes) - 2, -1, -1):
+        t0, x0 = keyframes[i]
+        t1, x1 = keyframes[i + 1]
+        dt = t1 - t0
+        if dt < 0.01 or abs(x1 - x0) < 3:
+            seg = str(int(round(x0)))
+        else:
+            dx = int(round(x1 - x0))
+            base = int(round(x0))
+            if dx >= 0:
+                seg = f"{base}+{dx}*(t-{t0:.2f})/{dt:.2f}"
+            else:
+                seg = f"{base}-{abs(dx)}*(t-{t0:.2f})/{dt:.2f}"
+        # Escape commas for ffmpeg filter context
+        expr = f"if(lt(t\\,{t1:.2f})\\,{seg}\\,{expr})"
+
+    # Clamp to valid range
+    expr = f"clip({expr}\\,0\\,{max_crop_x})"
+    return expr
+
 
 
 # ─────────────────────────── step 5: generate shorts ─────────────
@@ -1016,10 +1053,12 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
             face_results.append(result)
             if result["mode"] == "dual":
                 print(f" 👥 TWO faces → split-screen")
+            elif result["mode"] == "tracking":
+                nk = len(result["keyframes"])
+                print(f" 📹 face tracking ({nk} keyframes)")
             elif result["mode"] == "single":
                 det = result.get('detections', '?')
-                fx = result.get('face_x_norm', 0)
-                print(f" 🎯 face@{fx:.0%} ({det} detections) → crop_x={result['crop_x']}")
+                print(f" 🎯 face detected ({det} frames) → static crop_x={result['crop_x']}")
             else:
                 print(f" ❌ no face → center crop")
 
@@ -1061,6 +1100,7 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
                    .replace("]", "\\]"))
 
         is_dual = face_info["mode"] == "dual"
+        is_tracking = face_info["mode"] == "tracking"
 
         if is_dual:
             # ── SPLIT-SCREEN: two faces stacked vertically ──
@@ -1074,6 +1114,11 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
             cx2 = int(f2_x * src_w - crop_w / 2)
             cx2 = max(0, min(cx2, src_w - crop_w))
             print(f"     👥 Split-screen: face1@{cx1}, face2@{cx2}")
+        elif is_tracking:
+            # ── DYNAMIC FACE TRACKING ──
+            tracking_expr = build_tracking_crop_expr(
+                face_info["keyframes"], src_w - crop_w)
+            print(f"     📹 Dynamic crop: {len(face_info['keyframes'])} keyframes")
         else:
             crop_x = face_info.get("crop_x", (src_w - crop_w) // 2)
 
@@ -1094,9 +1139,6 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
                 if sub_filter_name:
                     vf = f"{base_filter};[stacked]{sub_filter_name}={ass_esc}[v]"
                 else:
-                    # No subs — rename output label
-                    vf = base_filter.replace("[stacked]", "[v]", 1)
-                    # Actually just change the last label
                     vf = (
                         f"[0:v]split=2[top][bot];"
                         f"[top]crop={crop_w}:{crop_h}:{cx1}:0,scale={out_w}:{half_h}[t];"
@@ -1114,8 +1156,25 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
                     "-movflags", "+faststart",
                     str(output_file),
                 ]
+            elif is_tracking:
+                # Dynamic face-following crop — expression-based crop x
+                crop_filter = f"crop={crop_w}:{crop_h}:{tracking_expr}:0,scale={out_w}:{out_h}"
+                if sub_filter_name:
+                    vf = f"{crop_filter},{sub_filter_name}={ass_esc}"
+                else:
+                    vf = crop_filter
+
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(start), "-i", str(video_path), "-t", str(dur),
+                    "-vf", vf,
+                    "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart",
+                    str(output_file),
+                ]
             else:
-                # Single/center mode — use -vf (simpler, auto-maps both streams)
+                # Single/center mode — static crop
                 crop_filter = f"crop={crop_w}:{crop_h}:{crop_x}:0,scale={out_w}:{out_h}"
                 if sub_filter_name:
                     vf = f"{crop_filter},{sub_filter_name}={ass_esc}"
