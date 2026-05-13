@@ -423,7 +423,7 @@ TRANSCRIPT SECTION:
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.4-mini",
             messages=[{"role": "user", "content": prompt}],
             response_format={
                 "type": "json_schema",
@@ -576,7 +576,7 @@ def select_best_clips(client, candidates: list[dict], video_title: str,
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-5.4-mini",
             messages=[{"role": "user", "content": f"""Select the BEST {num_shorts} clips from {len(candidates)} candidates for "{video_title}".
 Consider: VARIETY of topics, QUALITY of hooks, NO time OVERLAP, HUMOR, REVERSALS, CONTROVERSY.
 TITLE: 5-8 words, curiosity gap, power words, no spoilers. All text in {language}.
@@ -689,15 +689,22 @@ def detect_faces_for_clip(python_path: str, video_path: Path,
       - face1_x, face2_x: float (for dual mode, normalized 0-1)
     """
     face_script = textwrap.dedent(f"""\
-        import json, sys
+        import json, sys, statistics
         try:
             import cv2
             import mediapipe as mp
-            fd = mp.solutions.face_detection.FaceDetection(
-                model_selection=1, min_detection_confidence=0.6)
+            # Use BOTH model_selection=0 (short-range, <2m) and 1 (full-range, <5m)
+            # Lower confidence threshold for varied camera angles/lighting
+            detectors = [
+                mp.solutions.face_detection.FaceDetection(
+                    model_selection=0, min_detection_confidence=0.35),
+                mp.solutions.face_detection.FaceDetection(
+                    model_selection=1, min_detection_confidence=0.35),
+            ]
             cap = cv2.VideoCapture('{video_path}')
             fps = cap.get(cv2.CAP_PROP_FPS) or 30
-            samples = [0.10, 0.25, 0.40, 0.50, 0.60, 0.75, 0.90]
+            # Sample 15 frames spread across the clip
+            samples = [i/16 for i in range(1, 16)]
             xs = []
             for frac in samples:
                 ft = {start_time} + {duration} * frac
@@ -705,15 +712,22 @@ def detect_faces_for_clip(python_path: str, video_path: Path,
                 ret, frame = cap.read()
                 if not ret: continue
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                res = fd.process(rgb)
-                if res.detections:
-                    for d in res.detections:
-                        b = d.location_data.relative_bounding_box
-                        cx = b.xmin + b.width / 2
-                        if b.width * b.height > 0.005:
-                            xs.append(cx)
+                frame_xs = []
+                for fd in detectors:
+                    res = fd.process(rgb)
+                    if res.detections:
+                        for d in res.detections:
+                            b = d.location_data.relative_bounding_box
+                            cx = b.xmin + b.width / 2
+                            # Accept any reasonably-sized face
+                            if b.width > 0.03 and b.height > 0.03:
+                                frame_xs.append(cx)
+                if frame_xs:
+                    # Deduplicate: if multiple detectors found same face, take median
+                    xs.append(statistics.median(frame_xs))
             cap.release()
-            fd.close()
+            for fd in detectors:
+                fd.close()
             if xs:
                 xs.sort()
                 clusters, cur = [], [xs[0]]
@@ -724,16 +738,19 @@ def detect_faces_for_clip(python_path: str, video_path: Path,
                         clusters.append(cur)
                         cur = [x]
                 clusters.append(cur)
-                if len(clusters) == 1:
-                    cx = sum(clusters[0])/len(clusters[0])
-                    print(json.dumps({{"mode": "single", "x": cx}}))
+                # Pick the largest cluster (most consistent face position)
+                clusters.sort(key=len, reverse=True)
+                if len(clusters) == 1 or len(clusters[0]) > len(clusters[1]) * 2:
+                    # Single dominant face — use median for robustness
+                    cx = statistics.median(clusters[0])
+                    print(json.dumps({{"mode": "single", "x": cx, "n": len(clusters[0])}}))
                 elif len(clusters) >= 2:
-                    c1 = sum(clusters[0])/len(clusters[0])
-                    c2 = sum(clusters[1])/len(clusters[1])
+                    c1 = statistics.median(clusters[0])
+                    c2 = statistics.median(clusters[1])
                     cf = {crop_w}/{src_w}
-                    if abs(c1-c2) < cf:
-                        # Both fit in one crop
-                        print(json.dumps({{"mode": "single", "x": (c1+c2)/2}}))
+                    if abs(c1-c2) < cf * 0.8:
+                        # Both fit in one crop with margin
+                        print(json.dumps({{"mode": "single", "x": (c1+c2)/2, "n": len(clusters[0])+len(clusters[1])}}))
                     else:
                         # Two faces too far apart → dual mode
                         print(json.dumps({{"mode": "dual", "face1_x": min(c1,c2), "face2_x": max(c1,c2)}}))
@@ -763,9 +780,13 @@ def detect_faces_for_clip(python_path: str, video_path: Path,
     elif mode == "single":
         face_x = data.get("x")
         if face_x is not None:
-            crop_x = int(face_x * src_w - crop_w / 2)
+            # Center crop on face, but bias slightly left of face center
+            # (in stand-up comedy, body extends below/around the face)
+            # This keeps the person comfortably centered, not at the edge
+            crop_x = int(face_x * src_w - crop_w * 0.45)  # face at 45% from left edge
             crop_x = max(0, min(crop_x, src_w - crop_w))
-            return {"mode": "single", "crop_x": crop_x}
+            return {"mode": "single", "crop_x": crop_x,
+                    "face_x_norm": face_x, "detections": data.get("n", 0)}
 
     return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
 
@@ -872,9 +893,11 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
             if result["mode"] == "dual":
                 print(f" 👥 TWO faces → split-screen")
             elif result["mode"] == "single":
-                print(f" face detected → crop_x={result['crop_x']}")
+                det = result.get('detections', '?')
+                fx = result.get('face_x_norm', 0)
+                print(f" 🎯 face@{fx:.0%} ({det} detections) → crop_x={result['crop_x']}")
             else:
-                print(f" no face → center")
+                print(f" ❌ no face → center crop")
 
     # Generate shorts
     print(f"\n✂️  Step 5/5: Cutting {len(clips)} shorts...")
