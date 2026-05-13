@@ -884,87 +884,38 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge
         if abs(c1 - c2) > (crop_w / src_w) * 0.8:
             return {"mode": "dual", "face1_x": min(c1, c2), "face2_x": max(c1, c2)}
 
-    # ══════════════════════════════════════════════════════════════════
-    # VIRTUAL CAMERA MODEL — damped spring with deadzone + velocity cap
-    # Mimics a human camera operator: smooth, no jitter, natural inertia
-    # ══════════════════════════════════════════════════════════════════
+    # ── Smooth with moving average (window = 2.5 seconds) ──
+    window = max(3, int(2.5 / frame_interval))
+    smoothed = []
+    for i in range(len(filled)):
+        s = max(0, i - window // 2)
+        e = min(len(filled), i + window // 2 + 1)
+        smoothed.append(sum(filled[s:e]) / (e - s))
 
+    # ── Convert to pixel crop positions ──
     max_crop_x = src_w - crop_w
-
-    # ── 1. Pre-smooth raw detections with EMA (low-pass filter) ──
-    # Alpha 0.10 ≈ heavy smoothing; kills detection noise/jitter
-    ema_alpha = 0.10
-    ema = [filled[0]]
-    for i in range(1, len(filled)):
-        ema.append(ema_alpha * filled[i] + (1 - ema_alpha) * ema[-1])
-    # Forward-backward EMA to remove phase delay
-    ema_back = [0.0] * len(ema)
-    ema_back[-1] = ema[-1]
-    for i in range(len(ema) - 2, -1, -1):
-        ema_back[i] = ema_alpha * ema[i] + (1 - ema_alpha) * ema_back[i + 1]
-    smoothed = [(ema[i] + ema_back[i]) / 2 for i in range(len(ema))]
-
-    # ── 2. Convert to raw target pixel positions ──
-    raw_targets = []
+    crop_positions = []
     for x_norm in smoothed:
         cx = int(x_norm * src_w - crop_w * 0.45)
         cx = max(0, min(cx, max_crop_x))
-        raw_targets.append(cx)
+        crop_positions.append(cx)
 
-    # ── 3. Virtual camera simulation ──
-    # Deadzone: don't move unless target is > deadzone_px away from current position
-    # Velocity cap: max pixels per second the crop can move (smooth panning)
-    # Damping: exponential approach to target (never overshoot)
-    deadzone_px = max(20, int(crop_w * 0.04))  # ~4% of crop width (~43px for 1080-from-1920)
-    max_velocity = crop_w * 0.5  # max ~half crop width per second (smooth pan speed)
-    approach_rate = 3.0  # damping factor (higher = faster approach once outside deadzone)
-
-    cam_pos = float(raw_targets[0])  # current virtual camera position
-    cam_positions = [cam_pos]
-
-    for i in range(1, len(raw_targets)):
-        target = float(raw_targets[i])
-        delta = target - cam_pos
-        dt = frame_interval
-
-        # Deadzone: if target is within deadzone, camera stays put
-        if abs(delta) <= deadzone_px:
-            cam_positions.append(cam_pos)
-            continue
-
-        # Outside deadzone: move towards target with damping
-        # Effective delta excludes the deadzone band (so movement starts gently)
-        effective_delta = delta - (deadzone_px if delta > 0 else -deadzone_px)
-        desired_velocity = effective_delta * approach_rate  # pixels/sec
-
-        # Clamp velocity
-        if abs(desired_velocity) > max_velocity:
-            desired_velocity = max_velocity if desired_velocity > 0 else -max_velocity
-
-        # Apply movement
-        movement = desired_velocity * dt
-        cam_pos += movement
-        cam_pos = max(0, min(cam_pos, max_crop_x))
-        cam_positions.append(cam_pos)
-
-    crop_positions = [int(round(p)) for p in cam_positions]
-
-    # ── 4. Reduce to keyframes (only meaningful movements > 25px) ──
+    # ── Reduce to keyframes (position changes > 15px) ──
     keyframes = [(0.0, crop_positions[0])]
     for i in range(1, len(crop_positions)):
         t = i * frame_interval
-        if abs(crop_positions[i] - keyframes[-1][1]) > 25 or i == len(crop_positions) - 1:
+        if abs(crop_positions[i] - keyframes[-1][1]) > 15 or i == len(crop_positions) - 1:
             keyframes.append((t, crop_positions[i]))
 
-    # If nearly static (range < 30px), use simple single mode
+    # If nearly static (range < 20px), use simple single mode
     min_x = min(kf[1] for kf in keyframes)
     max_x_val = max(kf[1] for kf in keyframes)
-    if max_x_val - min_x < 30:
+    if max_x_val - min_x < 20:
         avg_x = int(statistics.mean([kf[1] for kf in keyframes]))
         avg_x = max(0, min(avg_x, max_crop_x))
         return {"mode": "single", "crop_x": avg_x, "detections": n_detected}
 
-    print(f"    📹 Tracking: {len(keyframes)} keyframes, x range {min_x}-{max_x_val}px (deadzone={deadzone_px}px)")
+    print(f"    📹 Tracking: {len(keyframes)} keyframes, x range {min_x}-{max_x_val}px")
     return {"mode": "tracking", "keyframes": keyframes}
 
 
