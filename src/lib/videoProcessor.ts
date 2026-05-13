@@ -206,20 +206,25 @@ function buildFilters(
   if (segments.length === 1 && segments[0].mode === "dual") {
     const seg = segments[0];
     const halfH = Math.floor(outH / 2);
+
+    // FIX: Each half-screen has aspect ratio 9:8, not 9:16!
+    // Using 9:16 cropW here would squish faces ~180% when scaling to halfH.
+    const dualCropW = Math.min(srcW, Math.round((srcH * 9) / 8));
+
     const cx1 = clampCrop(
-      Math.round((seg.face1X ?? 0) - cropW / 2),
+      Math.round((seg.face1X ?? 0) - dualCropW / 2),
       srcW,
-      cropW,
+      dualCropW,
     );
     const cx2 = clampCrop(
-      Math.round((seg.face2X ?? 0) - cropW / 2),
+      Math.round((seg.face2X ?? 0) - dualCropW / 2),
       srcW,
-      cropW,
+      dualCropW,
     );
     let fc =
       `[0:v]split=2[top][bot];` +
-      `[top]crop=${cropW}:${cropH}:${cx1}:0,scale=${outW}:${halfH}[t];` +
-      `[bot]crop=${cropW}:${cropH}:${cx2}:0,scale=${outW}:${halfH}[b];` +
+      `[top]crop=${dualCropW}:${cropH}:${cx1}:0,scale=${outW}:${halfH}[t];` +
+      `[bot]crop=${dualCropW}:${cropH}:${cx2}:0,scale=${outW}:${halfH}[b];` +
       `[t][b]vstack=inputs=2[stacked]`;
     if (hasSubs) {
       fc += `;[stacked]ass=subs.ass[v]`;
@@ -242,21 +247,23 @@ function buildFilters(
     const t1 = seg.endTime;
     if (seg.mode === "dual") {
       const halfH = Math.floor(outH / 2);
+      // FIX: Each half-screen has aspect ratio 9:8, not 9:16
+      const dualCropW = Math.min(srcW, Math.round((srcH * 9) / 8));
       const cx1 = clampCrop(
-        Math.round((seg.face1X ?? 0) - cropW / 2),
+        Math.round((seg.face1X ?? 0) - dualCropW / 2),
         srcW,
-        cropW,
+        dualCropW,
       );
       const cx2 = clampCrop(
-        Math.round((seg.face2X ?? 0) - cropW / 2),
+        Math.round((seg.face2X ?? 0) - dualCropW / 2),
         srcW,
-        cropW,
+        dualCropW,
       );
       // Each split output needs its own split→crop→vstack
       fc +=
         `;[s${i}]split=2[s${i}a][s${i}b]` +
-        `;[s${i}a]crop=${cropW}:${cropH}:${cx1}:0,scale=${outW}:${halfH}[s${i}ac]` +
-        `;[s${i}b]crop=${cropW}:${cropH}:${cx2}:0,scale=${outW}:${halfH}[s${i}bc]` +
+        `;[s${i}a]crop=${dualCropW}:${cropH}:${cx1}:0,scale=${outW}:${halfH}[s${i}ac]` +
+        `;[s${i}b]crop=${dualCropW}:${cropH}:${cx2}:0,scale=${outW}:${halfH}[s${i}bc]` +
         `;[s${i}ac][s${i}bc]vstack=inputs=2,setpts=PTS-STARTPTS[seg${i}]`;
     } else {
       const cropX =

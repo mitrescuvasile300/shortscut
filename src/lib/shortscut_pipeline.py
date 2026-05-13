@@ -884,19 +884,20 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge
         if abs(c1 - c2) > (crop_w / src_w) * 0.8:
             return {"mode": "dual", "face1_x": min(c1, c2), "face2_x": max(c1, c2)}
 
-    # ── Smooth with moving average (window = 2.5 seconds) ──
-    window = max(3, int(2.5 / frame_interval))
-    smoothed = []
-    for i in range(len(filled)):
-        s = max(0, i - window // 2)
-        e = min(len(filled), i + window // 2 + 1)
-        smoothed.append(sum(filled[s:e]) / (e - s))
+    # ── Smooth with Exponential Moving Average (EMA) for cinematic camera motion ──
+    # EMA gives natural acceleration/deceleration vs simple moving average's ping-pong
+    # alpha=0.12: low = smooth/heavy (0=frozen), high = responsive/raw (1=no smoothing)
+    alpha = 0.12
+    smoothed = [filled[0]]
+    for val in filled[1:]:
+        new_val = (alpha * val) + ((1 - alpha) * smoothed[-1])
+        smoothed.append(new_val)
 
     # ── Convert to pixel crop positions ──
     max_crop_x = src_w - crop_w
     crop_positions = []
     for x_norm in smoothed:
-        cx = int(x_norm * src_w - crop_w * 0.45)
+        cx = int((x_norm * src_w) - (crop_w * 0.45))
         cx = max(0, min(cx, max_crop_x))
         crop_positions.append(cx)
 
@@ -1107,13 +1108,15 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
             f1_x = face_info["face1_x"]  # normalized 0-1
             f2_x = face_info["face2_x"]  # normalized 0-1
 
-            # Each half: crop around each face, scale to 1080x960
+            # FIX: Each half-screen is 1080x960 = aspect 9:8, NOT 9:16!
+            # Using crop_w (9:16) would squish faces ~180% when scaling.
             half_h = out_h // 2  # 960
-            cx1 = int(f1_x * src_w - crop_w / 2)
-            cx1 = max(0, min(cx1, src_w - crop_w))
-            cx2 = int(f2_x * src_w - crop_w / 2)
-            cx2 = max(0, min(cx2, src_w - crop_w))
-            print(f"     👥 Split-screen: face1@{cx1}, face2@{cx2}")
+            dual_crop_w = min(src_w, int(src_h * 9 / 8))
+            cx1 = int(f1_x * src_w - dual_crop_w / 2)
+            cx1 = max(0, min(cx1, src_w - dual_crop_w))
+            cx2 = int(f2_x * src_w - dual_crop_w / 2)
+            cx2 = max(0, min(cx2, src_w - dual_crop_w))
+            print(f"     👥 Split-screen: face1@{cx1}, face2@{cx2} (dual_crop_w={dual_crop_w})")
         elif is_tracking:
             # ── DYNAMIC FACE TRACKING ──
             tracking_expr = build_tracking_crop_expr(
@@ -1132,8 +1135,8 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
             if is_dual:
                 base_filter = (
                     f"[0:v]split=2[top][bot];"
-                    f"[top]crop={crop_w}:{crop_h}:{cx1}:0,scale={out_w}:{half_h}[t];"
-                    f"[bot]crop={crop_w}:{crop_h}:{cx2}:0,scale={out_w}:{half_h}[b];"
+                    f"[top]crop={dual_crop_w}:{crop_h}:{cx1}:0,scale={out_w}:{half_h}[t];"
+                    f"[bot]crop={dual_crop_w}:{crop_h}:{cx2}:0,scale={out_w}:{half_h}[b];"
                     f"[t][b]vstack[stacked]"
                 )
                 if sub_filter_name:
@@ -1141,8 +1144,8 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
                 else:
                     vf = (
                         f"[0:v]split=2[top][bot];"
-                        f"[top]crop={crop_w}:{crop_h}:{cx1}:0,scale={out_w}:{half_h}[t];"
-                        f"[bot]crop={crop_w}:{crop_h}:{cx2}:0,scale={out_w}:{half_h}[b];"
+                        f"[top]crop={dual_crop_w}:{crop_h}:{cx1}:0,scale={out_w}:{half_h}[t];"
+                        f"[bot]crop={dual_crop_w}:{crop_h}:{cx2}:0,scale={out_w}:{half_h}[b];"
                         f"[t][b]vstack[v]"
                     )
 

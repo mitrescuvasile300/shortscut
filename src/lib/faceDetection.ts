@@ -303,49 +303,37 @@ export function getVideoDimensions(
   });
 }
 
-// ── Face detection on a single frame (runs both models) ────────────────
+// ── Face detection on a single frame (single model — short_range) ──────
+// Note: MODEL_FULL currently points to the same tflite as MODEL_SHORT
+// (tasks-vision doesn't ship a separate full_range yet). Running it twice
+// wastes ~50% of CPU/GPU budget for zero benefit. When an official
+// blaze_face_full_range.tflite for Tasks Vision lands, re-add dual detection.
 async function detectFacesInFrame(
   imageData: ImageData,
   canvas: HTMLCanvasElement,
 ): Promise<FaceInfo[]> {
-  const { short, full } = await getDetectors();
+  const { short } = await getDetectors();
   const ctx = canvas.getContext("2d");
   if (!ctx) return [];
   ctx.putImageData(imageData, 0, 0);
 
-  const minPxW = 30; // absolute pixel minimum: ~24-30px is MediaPipe's reliable floor
+  const minPxW = 30;
   const minPxH = 30;
 
-  const collect = (det: FaceDetector): FaceInfo[] => {
-    const out: FaceInfo[] = [];
-    const res = det.detect(canvas);
-    for (const d of res.detections) {
-      const bb = d.boundingBox;
-      if (!bb) continue;
-      if (bb.width < minPxW || bb.height < minPxH) continue;
-      out.push({
-        centerX: bb.originX + bb.width / 2,
-        centerY: bb.originY + bb.height / 2,
-        width: bb.width,
-        height: bb.height,
-      });
-    }
-    return out;
-  };
-
-  // Run both, then dedupe (same face often detected by both models)
-  const a = collect(short);
-  const b = collect(full);
-  const all = [...a];
-  for (const f of b) {
-    const dup = all.some(
-      g =>
-        Math.abs(g.centerX - f.centerX) < g.width * 0.5 &&
-        Math.abs(g.centerY - f.centerY) < g.height * 0.5,
-    );
-    if (!dup) all.push(f);
+  const out: FaceInfo[] = [];
+  const res = short.detect(canvas);
+  for (const d of res.detections) {
+    const bb = d.boundingBox;
+    if (!bb || bb.width < minPxW || bb.height < minPxH) continue;
+    out.push({
+      centerX: bb.originX + bb.width / 2,
+      centerY: bb.originY + bb.height / 2,
+      width: bb.width,
+      height: bb.height,
+    });
   }
-  return all;
+
+  return out;
 }
 
 // ── Clustering ─────────────────────────────────────────────────────────
