@@ -104,13 +104,6 @@ interface FrameSample {
   faces: FaceInfo[];
 }
 
-interface Cluster {
-  centerX: number;
-  medianArea: number;
-  count: number;
-  faces: FaceInfo[];
-}
-
 /**
  * A segment of the clip with its own crop position.
  * If `mode === "dual"` we split-screen the two faces vertically (top/bottom).
@@ -337,109 +330,6 @@ async function detectFacesInFrame(
 }
 
 // ── Clustering ─────────────────────────────────────────────────────────
-/**
- * Cluster face detections by X position.
- * Threshold scales with face width (half a face), not frame width.
- * This stops two distinct people from being merged in wide shots.
- */
-function clusterFaces(allFaces: FaceInfo[]): Cluster[] {
-  if (allFaces.length === 0) return [];
-
-  const clusters: {
-    faces: FaceInfo[];
-  }[] = [];
-
-  for (const face of allFaces) {
-    let merged = false;
-    for (const c of clusters) {
-      // Threshold = half a face width (whichever face is larger)
-      const refW = Math.max(face.width, ...c.faces.map(f => f.width));
-      const threshold = refW * 0.5;
-      const clusterCx =
-        c.faces.reduce((s, f) => s + f.centerX, 0) / c.faces.length;
-      if (Math.abs(face.centerX - clusterCx) < threshold) {
-        c.faces.push(face);
-        merged = true;
-        break;
-      }
-    }
-    if (!merged) clusters.push({ faces: [face] });
-  }
-
-  return clusters.map(c => {
-    const areas = c.faces.map(f => f.width * f.height).sort((a, b) => a - b);
-    const medianArea = areas[Math.floor(areas.length / 2)];
-    const centerX = c.faces.reduce((s, f) => s + f.centerX, 0) / c.faces.length;
-    return {
-      centerX,
-      medianArea,
-      count: c.faces.length,
-      faces: c.faces,
-    };
-  });
-}
-
-/**
- * Decide a crop for a single set of faces.
- * Implements: 0.45 headroom bias for single, dual split-screen for two-person
- * wide shots, "most visible" tiebroken by count then area.
- */
-function decideCrop(
-  clusters: Cluster[],
-  videoWidth: number,
-  cropWidth: number,
-): {
-  mode: "single" | "dual" | "center";
-  cropX?: number;
-  face1X?: number;
-  face2X?: number;
-} {
-  if (clusters.length === 0) {
-    return {
-      mode: "center",
-      cropX: Math.round((videoWidth - cropWidth) / 2),
-    };
-  }
-
-  // Sort: most samples first, then largest median area as tiebreaker
-  clusters.sort((a, b) => b.count - a.count || b.medianArea - a.medianArea);
-
-  if (clusters.length === 1) {
-    const cx = clusters[0].centerX;
-    // 0.45 bias: face sits at 45% from the left edge of the crop (Python reference).
-    // This gives headroom + body lead-room for vertical short-form framing.
-    let cropX = Math.round(cx - cropWidth * 0.45);
-    cropX = Math.max(0, Math.min(cropX, videoWidth - cropWidth));
-    return { mode: "single", cropX };
-  }
-
-  const p1 = clusters[0];
-  const p2 = clusters[1];
-
-  // Only consider second person "real" if they appeared in at least half as many
-  // samples as the primary — kills noise / single-frame false positives.
-  if (p2.count < Math.max(2, p1.count / 2)) {
-    let cropX = Math.round(p1.centerX - cropWidth * 0.45);
-    cropX = Math.max(0, Math.min(cropX, videoWidth - cropWidth));
-    return { mode: "single", cropX };
-  }
-
-  const leftMost = Math.min(p1.centerX, p2.centerX);
-  const rightMost = Math.max(p1.centerX, p2.centerX);
-  const span = rightMost - leftMost;
-
-  if (span < cropWidth * 0.8) {
-    // Both fit comfortably — center between them
-    const midX = (p1.centerX + p2.centerX) / 2;
-    let cropX = Math.round(midX - cropWidth / 2);
-    cropX = Math.max(0, Math.min(cropX, videoWidth - cropWidth));
-    return { mode: "single", cropX };
-  }
-
-  // Don't fit — DUAL / split-screen mode
-  return { mode: "dual", face1X: leftMost, face2X: rightMost };
-}
-
 // ── Scene-cut detection from signatures ────────────────────────────────
 /**
  * Given 8×8 luminance signatures sampled across the clip, find time indices
@@ -569,23 +459,69 @@ export async function planClipCrop(
   // Detect scene boundaries (indices into frames/sigs)
   const boundaries = findSceneBoundaries(sigs);
 
-  // For each segment, cluster only the faces from that segment's samples
+  // For each segment, determine crop mode by analysing per-frame face hits
   const segments: CropSegment[] = [];
   for (let s = 0; s < boundaries.length - 1; s++) {
     const a = boundaries[s];
     const b = boundaries[s + 1];
-    const segFaces: FaceInfo[] = [];
-    for (let i = a; i < b; i++) segFaces.push(...frames[i].faces);
-    const clusters = clusterFaces(segFaces);
-    const decision = decideCrop(clusters, videoWidth, cropWidth);
-    segments.push({
-      startTime: frames[a].time,
-      endTime: b < frames.length ? frames[b].time : clipDuration,
-      mode: decision.mode,
-      cropX: decision.cropX,
-      face1X: decision.face1X,
-      face2X: decision.face2X,
+    const segFrames = frames.slice(a, b);
+    const segStart = frames[a].time;
+    const segEnd = b < frames.length ? frames[b].time : clipDuration;
+
+    // ── DUAL detection: at least 2 faces visible *simultaneously* in a frame,
+    //    separated by > 70% of crop width (rules out false double-detections)
+    const dualFrames = segFrames.filter((f) => f.faces.length >= 2);
+    const validDuals = dualFrames.filter((f) => {
+      const xs = [...f.faces].map((fc) => fc.centerX).sort((m, n) => m - n);
+      return xs[xs.length - 1] - xs[0] > cropWidth * 0.7;
     });
+
+    // Require solid evidence: ≥15% of sampled frames (min 3) must show valid dual
+    if (validDuals.length >= Math.max(3, segFrames.length * 0.15)) {
+      const f1List = validDuals
+        .map((f) => Math.min(...f.faces.map((x) => x.centerX)))
+        .sort((x, y) => x - y);
+      const f2List = validDuals
+        .map((f) => Math.max(...f.faces.map((x) => x.centerX)))
+        .sort((x, y) => x - y);
+
+      const face1Median = f1List[Math.floor(f1List.length / 2)];
+      const face2Median = f2List[Math.floor(f2List.length / 2)];
+
+      segments.push({
+        startTime: segStart,
+        endTime: segEnd,
+        mode: "dual",
+        face1X: face1Median / videoWidth,
+        face2X: face2Median / videoWidth,
+      });
+      continue;
+    }
+
+    // ── SINGLE mode: median of ALL face X positions across every frame in segment
+    const flatXs = segFrames.flatMap((f) => f.faces.map((x) => x.centerX));
+
+    if (flatXs.length > 0) {
+      flatXs.sort((x, y) => x - y);
+      const medianX = flatXs[Math.floor(flatXs.length / 2)];
+      let cropX = Math.round(medianX - cropWidth * 0.5);
+      cropX = Math.max(0, Math.min(cropX, videoWidth - cropWidth));
+
+      segments.push({
+        startTime: segStart,
+        endTime: segEnd,
+        mode: "single",
+        cropX,
+      });
+    } else {
+      // No faces at all → center fallback
+      segments.push({
+        startTime: segStart,
+        endTime: segEnd,
+        mode: "center",
+        cropX: (videoWidth - cropWidth) / 2,
+      });
+    }
   }
 
   // Merge adjacent identical segments (e.g. same single crop across cuts)

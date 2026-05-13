@@ -844,79 +844,89 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge
     shutil.rmtree(tmp_frames_dir, ignore_errors=True)
 
     raw = data.get("results", [])
-    n_detected = sum(1 for r in raw if r is not None)
+    n_detected = sum(1 for r in raw if r is not None and len(r) > 0)
 
     if n_detected < 2:
         print(f"    ⚠️  Only {n_detected} face detections — using center")
         return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
 
-    # ── Fill gaps by nearest-neighbor interpolation ──
-    filled = list(raw)
-    last_good = None
-    for i in range(len(filled)):
-        if filled[i] is not None:
-            last_good = filled[i]
-        elif last_good is not None:
-            filled[i] = last_good
-    last_good = None
-    for i in range(len(filled) - 1, -1, -1):
-        if filled[i] is not None:
-            last_good = filled[i]
-        elif last_good is not None:
-            filled[i] = last_good
+    # ── DUAL detection: both faces must appear SIMULTANEOUSLY in the same frame ──
+    dual_frames = [f_arr for f_arr in raw if f_arr and len(f_arr) >= 2]
+    valid_duals = []
+    for xs in dual_frames:
+        s_xs = sorted(xs)
+        if (s_xs[-1] - s_xs[0]) > crop_w * 0.65:
+            valid_duals.append((s_xs[0], s_xs[-1]))
 
-    if any(v is None for v in filled):
+    # Require solid evidence: ≥15% of frames (min 3) must show valid dual
+    if len(valid_duals) >= max(3, int(len(raw) * 0.15)):
+        f1 = statistics.median([x[0] for x in valid_duals]) / src_w
+        f2 = statistics.median([x[1] for x in valid_duals]) / src_w
+        return {"mode": "dual", "face1_x": f1, "face2_x": f2}
+
+    # ── SINGLE tracking with deadzone/hysteresis (cameraman behavior) ──
+    track_series = []
+    for faces_arr in raw:
+        if faces_arr and len(faces_arr) > 0:
+            track_series.append(statistics.median(faces_arr) / src_w)
+        else:
+            track_series.append(None)
+
+    # Fill gaps (nearest-neighbor forward then backward)
+    filled = list(track_series)
+    last = None
+    for i in range(len(filled)):
+        if filled[i] is not None: last = filled[i]
+        elif last is not None: filled[i] = last
+    last = None
+    for i in range(len(filled) - 1, -1, -1):
+        if filled[i] is not None: last = filled[i]
+        elif last is not None: filled[i] = last
+
+    if None in filled or len(filled) == 0:
         return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
 
-    # ── Check for dual-face scenario ──
-    vals_sorted = sorted(filled)
-    clusters, cur = [], [vals_sorted[0]]
-    for v in vals_sorted[1:]:
-        if abs(v - cur[-1]) < 0.15:
-            cur.append(v)
-        else:
-            clusters.append(cur)
-            cur = [v]
-    clusters.append(cur)
-    if len(clusters) >= 2:
-        c1 = statistics.median(clusters[0])
-        c2 = statistics.median(clusters[1])
-        if abs(c1 - c2) > (crop_w / src_w) * 0.8:
-            return {"mode": "dual", "face1_x": min(c1, c2), "face2_x": max(c1, c2)}
+    # Deadzone: camera ignores micro-movements within this margin (normalized)
+    dz_w = (crop_w * 0.20) / src_w
+    alpha = 0.1  # EMA smoothing factor (cinematic float)
 
-    # ── Smooth with Exponential Moving Average (EMA) for cinematic camera motion ──
-    # EMA gives natural acceleration/deceleration vs simple moving average's ping-pong
-    # alpha=0.12: low = smooth/heavy (0=frozen), high = responsive/raw (1=no smoothing)
-    alpha = 0.12
-    smoothed = [filled[0]]
-    for val in filled[1:]:
-        new_val = (alpha * val) + ((1 - alpha) * smoothed[-1])
-        smoothed.append(new_val)
+    cam_x = filled[0]  # initial camera focus position (normalized)
+    smoothed = []
+
+    for head_pos in filled:
+        # Only move camera if face exits the deadzone box
+        if head_pos > cam_x + dz_w:
+            targ = head_pos - dz_w
+        elif head_pos < cam_x - dz_w:
+            targ = head_pos + dz_w
+        else:
+            # Face is inside deadzone — camera stays put (static, clean)
+            targ = cam_x
+
+        cam_x = (alpha * targ) + ((1 - alpha) * cam_x)
+        smoothed.append(cam_x)
 
     # ── Convert to pixel crop positions ──
     max_crop_x = src_w - crop_w
     crop_positions = []
-    for x_norm in smoothed:
-        cx = int((x_norm * src_w) - (crop_w * 0.45))
+    for cur_focus in smoothed:
+        cx = int((cur_focus * src_w) - (crop_w * 0.5))
         cx = max(0, min(cx, max_crop_x))
         crop_positions.append(cx)
 
-    # ── Reduce to keyframes (position changes > 15px) ──
+    # ── Reduce to keyframes (>10px movement) ──
     keyframes = [(0.0, crop_positions[0])]
     for i in range(1, len(crop_positions)):
-        t = i * frame_interval
-        if abs(crop_positions[i] - keyframes[-1][1]) > 15 or i == len(crop_positions) - 1:
-            keyframes.append((t, crop_positions[i]))
+        if abs(crop_positions[i] - keyframes[-1][1]) > 10 or i == len(crop_positions) - 1:
+            keyframes.append((i * frame_interval, crop_positions[i]))
 
-    # If nearly static (range < 20px), use simple single mode
-    min_x = min(kf[1] for kf in keyframes)
-    max_x_val = max(kf[1] for kf in keyframes)
-    if max_x_val - min_x < 20:
-        avg_x = int(statistics.mean([kf[1] for kf in keyframes]))
-        avg_x = max(0, min(avg_x, max_crop_x))
-        return {"mode": "single", "crop_x": avg_x, "detections": n_detected}
+    # If range < 30px, it's effectively static — single mode
+    rng_val = max(kf[1] for kf in keyframes) - min(kf[1] for kf in keyframes)
+    if rng_val < 30:
+        avg_x = max(0, min(int(statistics.mean([p[1] for p in keyframes])), max_crop_x))
+        return {"mode": "single", "crop_x": avg_x}
 
-    print(f"    📹 Tracking: {len(keyframes)} keyframes, x range {min_x}-{max_x_val}px")
+    print(f"    📹 Tracking: {len(keyframes)} keyframes, x range {rng_val}px")
     return {"mode": "tracking", "keyframes": keyframes}
 
 
