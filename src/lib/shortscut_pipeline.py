@@ -718,7 +718,7 @@ def detect_faces_for_clip(python_path: str, video_path: Path,
 
     # Run face detection on ALL frames in subprocess
     face_script = textwrap.dedent(f"""\
-import json, sys, os, statistics
+import json, sys, os, statistics, math, urllib.request
 
 frame_paths = {frame_paths_json}
 src_w = {src_w}
@@ -727,70 +727,91 @@ src_h = {src_h}
 def log(msg):
     print(f"DIAG: {{msg}}", file=sys.stderr)
 
-# Per-frame results: list of {x, area, score} or None
-# (area normalized = w*h, score = confidence; used for primary-face
-#  selection across frames and cut detection in the tracking pass)
+# Per-frame results: list of [{{x, y, w, h, score}}, ...] OR None.
+# We keep ALL detected faces per frame (not just one primary), because the
+# planning pass needs the full list to distinguish "single speaker" from
+# "two people simultaneously visible" (real dual-mode).
 results = [None] * len(frame_paths)
 
-# ── METHOD 1: MediaPipe face detection ──
+# ── METHOD 1: MediaPipe Tasks API ──
+# The legacy `mp.solutions.face_detection` was removed in recent mediapipe
+# builds (the user's environment shows: "module 'mediapipe' has no attribute
+# 'solutions'"). The current API is `mediapipe.tasks.python.vision`, which
+# requires a TFLite model file passed explicitly.
 mp_count = 0
 try:
     import cv2
+    import numpy as np
     import mediapipe as mp
-    log(f"MediaPipe {{mp.__version__}} + OpenCV {{cv2.__version__}}, {{len(frame_paths)}} frames")
+    from mediapipe.tasks import python as mp_tasks
+    from mediapipe.tasks.python import vision as mp_vision
 
-    # Use a single short-range detector with moderate confidence.
-    # The old code merged short_range + full_range outputs, which double-
-    # detected the same face and contaminated the median used downstream.
-    detector = mp.solutions.face_detection.FaceDetection(
-        model_selection=0, min_detection_confidence=0.3
+    # Download blaze_face_short_range model on first use; cache in /tmp.
+    MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite"
+    model_path = "/tmp/blaze_face_short_range.tflite"
+    if not os.path.exists(model_path):
+        log("Downloading BlazeFace model...")
+        urllib.request.urlretrieve(MODEL_URL, model_path)
+
+    base = mp_tasks.BaseOptions(model_asset_path=model_path)
+    opts = mp_vision.FaceDetectorOptions(
+        base_options=base,
+        min_detection_confidence=0.3,
     )
+    detector = mp_vision.FaceDetector.create_from_options(opts)
+    log(f"MediaPipe Tasks {{mp.__version__}} + OpenCV {{cv2.__version__}}, {{len(frame_paths)}} frames")
 
     for idx, fp in enumerate(frame_paths):
-        img = cv2.imread(fp)
-        if img is None:
+        img_bgr = cv2.imread(fp)
+        if img_bgr is None:
             continue
-        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        res = detector.process(rgb)
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        h_img, w_img = img_rgb.shape[:2]
+        # MediaPipe Tasks expects a uint8 RGB Image
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
+        res = detector.detect(mp_img)
         if not res.detections:
             continue
-        # Score each candidate by area × confidence × proximity_to_prev_primary
-        # to track ONE primary face across frames (the speaker), not the
-        # median of all detected faces (which can include audience members).
-        # Read previous primary's normalized x for proximity term (sigma=0.30).
-        prev_x = None
-        for k in range(idx - 1, -1, -1):
-            if results[k] is not None:
-                prev_x = results[k]["x"]
-                break
-        best = None
-        best_score = -1
+        frame_faces = []
+        # In Tasks API, BoundingBox uses pixel coords (origin_x, origin_y,
+        # width, height). Keypoints are NormalizedKeypoint in [0,1].
+        # Keypoint order for BlazeFace: 0=left eye, 1=right eye, 2=nose tip,
+        # 3=mouth, 4=left ear tragion, 5=right ear tragion.
+        min_face_px = max(40, int(w_img * 0.04))
         for d in res.detections:
-            b = d.location_data.relative_bounding_box
-            if b.width < 0.02 or b.height < 0.02:
+            bb = d.bounding_box
+            if bb.width < min_face_px or bb.height < min_face_px:
                 continue
-            cx = b.xmin + b.width / 2
-            area = b.width * b.height
-            score = d.score[0] if d.score else 0.5
-            proximity = 1.0
-            if prev_x is not None:
-                dx = cx - prev_x
-                # sigma = 0.30, normalized (matches the TS pipeline)
-                proximity = 2.71828 ** (-(dx * dx) / (2 * 0.30 * 0.30))
-            s = area * score * proximity
-            if s > best_score:
-                best_score = s
-                best = {{"x": cx, "area": area, "score": score}}
-        if best is not None:
-            results[idx] = best
+            score = d.categories[0].score if d.categories else 0.5
+            # Prefer nose keypoint as anchor (more stable than bbox center
+            # during head turns; bbox grows toward the back of the head).
+            cx_px = bb.origin_x + bb.width / 2.0
+            cy_px = bb.origin_y + bb.height / 2.0
+            if d.keypoints and len(d.keypoints) > 2:
+                kp = d.keypoints[2]
+                cx_px = kp.x * w_img
+                cy_px = kp.y * h_img
+            frame_faces.append({{
+                "x": cx_px / w_img,          # 0..1, normalized X
+                "y": cy_px / h_img,          # 0..1, normalized Y
+                "w": bb.width / w_img,       # 0..1, normalized width
+                "h": bb.height / h_img,      # 0..1, normalized height
+                "score": float(score),
+            }})
+        if frame_faces:
+            results[idx] = frame_faces
             mp_count += 1
-
     detector.close()
     log(f"MediaPipe: {{mp_count}}/{{len(frame_paths)}} frames")
 except Exception as e:
+    import traceback
     log(f"MediaPipe error: {{e}}")
+    log(traceback.format_exc().replace(chr(10), ' | '))
 
 # ── METHOD 2: Haar cascade fallback for frames where MP failed ──
+# Tightened minSize from 3% to 8% of frame width — at 3%, Haar caught
+# audience members in stand-up footage, leading to spurious dual detection.
+# 8% of 1920 = 154 px; that's about a face at ~3m, which is what we want.
 haar_count = 0
 try:
     import cv2
@@ -806,34 +827,34 @@ try:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             gray = cv2.equalizeHist(gray)
             h_img, w_img = gray.shape
-            faces = face_cascade.detectMultiScale(gray, 1.05, 3,
-                minSize=(int(w_img * 0.03), int(h_img * 0.03)))
-            if len(faces) > 0:
-                # Largest face = closest = primary speaker
-                areas = [w * h for (x, y, w, h) in faces]
-                bi = areas.index(max(areas))
-                bx, by, bw, bh = faces[bi]
-                # Haar has no score; use 0.5 (treat as moderate confidence)
-                results[idx] = {{
-                    "x": (bx + bw / 2) / w_img,
-                    "area": (bw / w_img) * (bh / h_img),
-                    "score": 0.5,
-                }}
-                haar_count += 1
+            min_face = max(80, int(w_img * 0.08))
+            faces = face_cascade.detectMultiScale(
+                gray, 1.1, 4, minSize=(min_face, min_face)
+            )
+            if len(faces) == 0:
+                continue
+            frame_faces = []
+            for (x, y, fw, fh) in faces:
+                frame_faces.append({{
+                    "x": (x + fw / 2.0) / w_img,
+                    "y": (y + fh / 2.0) / h_img,
+                    "w": fw / w_img,
+                    "h": fh / h_img,
+                    "score": 0.5,  # Haar has no confidence score
+                }})
+            results[idx] = frame_faces
+            haar_count += 1
         if haar_count:
             log(f"Haar: filled {{haar_count}} more frames")
 except Exception as e:
     log(f"Haar error: {{e}}")
 
-# ── METHOD 3: Edge analysis is a poor fallback for tracking ──
-# Edge-based "best vertical strip" guesses a face location even when none
-# exists, which is worse than admitting "no detection" (which lets the
-# downstream pipeline emit a center-crop segment honestly). Disabled.
-edge_count = 0
+# Edge-analysis fallback removed: it guessed a face position even when none
+# existed, which is worse than letting downstream emit an honest center crop.
 
 detected = sum(1 for r in results if r is not None)
-log(f"Total: {{detected}}/{{len(results)}} frames with position")
-print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge": edge_count}}))
+log(f"Total: {{detected}}/{{len(results)}} frames with faces")
+print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count}}))
 """)
 
     r = subprocess.run(
@@ -857,35 +878,122 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge
     shutil.rmtree(tmp_frames_dir, ignore_errors=True)
 
     raw = data.get("results", [])
-    n_detected = sum(1 for r in raw if r is not None)
+    n = len(raw)
+    n_detected = sum(1 for r in raw if r is not None and len(r) > 0)
 
     if n_detected < 2:
         print(f"    ⚠️  Only {n_detected} face detections — using center")
         return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
 
-    n = len(raw)
     fps_sample = extract_fps
     dt = 1.0 / fps_sample
+    max_crop_x = src_w - crop_w
 
-    # ── DUAL detection: two faces visible SIMULTANEOUSLY ──
-    # Note: the new per-frame `results` is a dict (single primary face),
-    # so we can no longer tell dual mode from raw. Dual is now decided in
-    # the TS pipeline (which keeps full face lists). The Python script is
-    # a dev reference; we skip dual mode and let tracking handle it.
+    # ──────────────────────────────────────────────────────────────────
+    #  Step 1: DUAL DETECTION (strict — two real speakers, side by side)
+    # ──────────────────────────────────────────────────────────────────
+    # Both faces must:
+    #   - Be visible in the SAME frame (not just somewhere across the clip)
+    #   - Be separated horizontally by ≥ 0.8 × cropWidth (so the split makes
+    #     visual sense — they wouldn't fit in a single 9:16 crop)
+    #   - Be at SIMILAR Y position (within ±25% of frame height). This is
+    #     the constraint that kills the "comedian on stage + audience in
+    #     front" false positive: comedian face Y ≈ 0.30, audience Y ≈ 0.85.
+    #   - Be SIMILAR in size (max/min area ratio ≤ 2.0). Same camera,
+    #     same distance → similar bounding-box sizes.
+    # And the dual configuration must hold in ≥ 85% of frames-with-faces.
+    min_sep_norm = (crop_w * 0.8) / src_w   # 0.253 on 1920×1080
+    y_tolerance = 0.25
+    size_ratio_max = 2.0
+    dual_consistency = 0.85
 
-    # ── Build raw normalized X track + face areas ──
-    raw_x = [(r["x"] if r else None) for r in raw]
-    raw_area = [(r["area"] if r else None) for r in raw]
+    frames_with_any = 0
+    frames_with_valid_dual = 0
+    valid_lefts = []
+    valid_rights = []
 
-    # ── Outlier rejection (local MAD) ──
-    # Reject single-frame spikes: face detector occasionally fires on
-    # posters/mirrors/spectators with a position far from the speaker.
-    cleaned = list(raw_x)
+    for frame_faces in raw:
+        if not frame_faces:
+            continue
+        frames_with_any += 1
+        if len(frame_faces) < 2:
+            continue
+        # Filter out any tiny detections (defensive — detection script also filters)
+        big = [f for f in frame_faces if f["w"] > 0.03 and f["h"] > 0.03]
+        if len(big) < 2:
+            continue
+        sorted_faces = sorted(big, key=lambda f: f["x"])
+        left = sorted_faces[0]
+        right = sorted_faces[-1]
+        if right["x"] - left["x"] < min_sep_norm:
+            continue
+        if abs(left["y"] - right["y"]) > y_tolerance:
+            continue
+        a_left = left["w"] * left["h"]
+        a_right = right["w"] * right["h"]
+        if min(a_left, a_right) < 1e-4:
+            continue
+        ratio = max(a_left, a_right) / min(a_left, a_right)
+        if ratio > size_ratio_max:
+            continue
+        frames_with_valid_dual += 1
+        valid_lefts.append(left["x"])
+        valid_rights.append(right["x"])
+
+    if (
+        frames_with_any > 0
+        and frames_with_valid_dual / frames_with_any >= dual_consistency
+        and len(valid_lefts) >= 3
+    ):
+        f1 = statistics.median(valid_lefts)
+        f2 = statistics.median(valid_rights)
+        print(f"    👥 Dual mode: left={f1:.2f}, right={f2:.2f} (in {frames_with_valid_dual}/{frames_with_any} frames)")
+        return {"mode": "dual", "face1_x": f1, "face2_x": f2}
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Step 2: SELECT PRIMARY FACE per frame (largest × confidence ×
+    #          proximity_to_previous_primary). This tracks ONE speaker
+    #          across frames instead of averaging all detected faces.
+    # ──────────────────────────────────────────────────────────────────
+    sigma = 0.30  # normalized
+    two_sigma_sq = 2 * sigma * sigma
+
+    primary_x = [None] * n
+    primary_area = [None] * n
+    prev_primary = None
+
+    for idx, frame_faces in enumerate(raw):
+        if not frame_faces:
+            continue
+        best = None
+        best_score = -1
+        for f in frame_faces:
+            area = f["w"] * f["h"]
+            score = f["score"]
+            proximity = 1.0
+            if prev_primary is not None:
+                dx = f["x"] - prev_primary["x"]
+                dy = f["y"] - prev_primary["y"]
+                proximity = math.exp(-(dx * dx + dy * dy) / two_sigma_sq)
+            s = area * score * proximity
+            if s > best_score:
+                best_score = s
+                best = f
+        if best is not None:
+            prev_primary = {"x": best["x"], "y": best["y"]}
+            primary_x[idx] = best["x"]
+            primary_area[idx] = best["w"] * best["h"]
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Step 3: OUTLIER REJECTION (local MAD over ±2 neighbors).
+    #          Kills single-frame spikes from poster/mirror false positives.
+    # ──────────────────────────────────────────────────────────────────
+    cleaned = list(primary_x)
     for i in range(n):
         if cleaned[i] is None:
             continue
-        ctx = [raw_x[j] for j in range(max(0, i - 2), min(n, i + 3))
-               if j != i and raw_x[j] is not None]
+        ctx = [primary_x[j] for j in range(max(0, i - 2), min(n, i + 3))
+               if j != i and primary_x[j] is not None]
         if len(ctx) < 2:
             continue
         med = statistics.median(ctx)
@@ -893,7 +1001,52 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge
         if abs(cleaned[i] - med) > 3 * mad + 0.02:
             cleaned[i] = None
 
-    # ── Find hard-reset markers (gaps ≥ 0.75 s) ──
+    valid = [v for v in cleaned if v is not None]
+    if len(valid) < max(2, int(n * 0.15)):
+        print(f"    ⚠️  Only {len(valid)} valid detections after outlier rejection → center")
+        return {"mode": "center", "crop_x": max_crop_x // 2}
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Step 4: TRY STATIC SINGLE CROP FIRST.
+    #          User spec: "default to static, only move camera when the
+    #          face goes more than half off-screen."
+    #          1. Find optimal static cropX (median face X, 0.45 headroom).
+    #          2. Count how many frames have face center OUTSIDE the
+    #             [cropX, cropX+cropW] window.
+    #          3. If ≤ 15% exit → use static; the rare exits will clip
+    #             the face partially, which the user accepts.
+    # ──────────────────────────────────────────────────────────────────
+    median_face_x_norm = statistics.median(valid)
+    median_face_x_px = median_face_x_norm * src_w
+    static_crop_x = int(median_face_x_px - crop_w * 0.45)
+    static_crop_x = max(0, min(static_crop_x, max_crop_x))
+
+    exit_count = 0
+    for v in valid:
+        face_px = v * src_w
+        if face_px < static_crop_x or face_px > static_crop_x + crop_w:
+            exit_count += 1
+    exit_fraction = exit_count / len(valid)
+
+    static_threshold = 0.15
+    if exit_fraction <= static_threshold:
+        print(
+            f"    📷 Static single (x={static_crop_x}, "
+            f"face exits crop in {exit_fraction * 100:.0f}% of frames ≤ {int(static_threshold * 100)}%)"
+        )
+        return {"mode": "single", "crop_x": static_crop_x}
+
+    print(
+        f"    🎥 Engaging tracking ({exit_fraction * 100:.0f}% of frames "
+        f"have face outside static crop)"
+    )
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Step 5: TRACKING MODE — smooth follow.
+    #
+    #  Find hard-reset markers (gaps ≥ 0.75 s) where camera state should
+    #  reset rather than EMA-into-stale-position.
+    # ──────────────────────────────────────────────────────────────────
     hard_reset = set()
     i = 0
     while i < n:
@@ -907,7 +1060,7 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge
             hard_reset.add(j)
         i = j
 
-    # ── Gap fill: ≤1.5 s linear interpolation, longer gaps stay null ──
+    # Gap fill: linear interpolation across short gaps (≤ 1.5 s)
     filled = list(cleaned)
     max_gap = max(1, int(1.5 * fps_sample))
     i = 0
@@ -919,28 +1072,23 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge
         while j < n and filled[j] is None:
             j += 1
         gap = j - i
-        prev = filled[i - 1] if i > 0 else None
-        nxt = filled[j] if j < n else None
-        if gap <= max_gap and prev is not None and nxt is not None:
+        prev_v = filled[i - 1] if i > 0 else None
+        next_v = filled[j] if j < n else None
+        if gap <= max_gap and prev_v is not None and next_v is not None:
             for k in range(i, j):
                 f = (k - i + 1) / (j - i + 1)
-                filled[k] = prev + (nxt - prev) * f
-        elif gap <= max_gap and prev is not None:
+                filled[k] = prev_v + (next_v - prev_v) * f
+        elif gap <= max_gap and prev_v is not None:
             for k in range(i, j):
-                filled[k] = prev
-        elif gap <= max_gap and nxt is not None:
+                filled[k] = prev_v
+        elif gap <= max_gap and next_v is not None:
             for k in range(i, j):
-                filled[k] = nxt
+                filled[k] = next_v
         i = j
 
-    # If too many nulls remain → center fallback
-    valid_count = sum(1 for v in filled if v is not None)
-    if valid_count < max(2, int(n * 0.15)):
-        return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
-
-    # ── Smoothing with cut detection, deadzone, EMA, velocity cap, re-anchor ──
+    # Smoothing: deadzone + EMA + velocity cap + cut detection + re-anchor
     dz_norm = (crop_w * 0.12) / src_w
-    alpha = 0.30  # τ = -dt/ln(1-α) = 0.70 s at 4 fps (was α=0.1, τ=4.7 s)
+    alpha = 0.30                                    # τ = 0.70 s at 4 fps
     max_pan_per_step = ((0.30 * crop_w) / src_w) * dt
     cut_position_delta = 0.25
     cut_area_ratio = 1.5
@@ -959,13 +1107,11 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge
         if head is None:
             cam[i] = None
             continue
-
-        # Cut detection
         is_cut = False
         if last_valid >= 0 and cam_x is not None:
             prev_head = filled[last_valid]
-            prev_a = raw_area[last_valid]
-            cur_a = raw_area[i]
+            prev_a = primary_area[last_valid]
+            cur_a = primary_area[i]
             if prev_head is not None and abs(head - prev_head) > cut_position_delta:
                 if prev_a is not None and cur_a is not None and (
                     cur_a / prev_a > cut_area_ratio or prev_a / cur_a > cut_area_ratio
@@ -973,17 +1119,15 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge
                     is_cut = True
                 elif prev_a is None or cur_a is None:
                     is_cut = True
-
         if cam_x is None or is_cut:
             cam_x = head
             cam[i] = cam_x
             last_valid = i
             last_moved = i
             continue
-
         moved = False
         if head > cam_x + dz_norm or head < cam_x - dz_norm:
-            targ = head  # FIX: was head - dz_w (caused permanent off-center)
+            targ = head
             moved = True
         else:
             targ = cam_x
@@ -993,20 +1137,16 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge
             nxt = cam_x + max_pan_per_step
         elif dv < -max_pan_per_step:
             nxt = cam_x - max_pan_per_step
-
-        # Re-anchoring: long static within deadzone → snap to face
         if not moved and last_moved >= 0 and i - last_moved >= reanchor_frames:
             nxt = head
             last_moved = i
         elif moved:
             last_moved = i
-
         cam_x = nxt
         cam[i] = cam_x
         last_valid = i
 
-    # ── Convert to pixel crop X, with 0.45 headroom bias ──
-    max_crop_x = src_w - crop_w
+    # Convert to pixel crop X with 0.45 headroom bias
     crop_positions = []
     for v in cam:
         if v is None:
@@ -1016,12 +1156,10 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge
             cx = max(0, min(cx, max_crop_x))
             crop_positions.append(cx)
 
-    # ── Build keyframes (RDP-style: only keep points where the trajectory ──
-    # deviates more than ε from the straight line between kept neighbors).
-    # Implemented as iterative refinement for simplicity.
+    # Keyframe reduction (greedy, ε = max(5px, 0.8% × cropWidth))
     valid_idx = [i for i, v in enumerate(crop_positions) if v is not None]
     if not valid_idx:
-        return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
+        return {"mode": "center", "crop_x": max_crop_x // 2}
 
     keyframes = []
     epsilon = max(5, int(crop_w * 0.008))
@@ -1031,19 +1169,18 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count, "edge
         if not keyframes:
             keyframes.append((t, x))
             continue
-        prev_t, prev_x = keyframes[-1]
-        # Linear interp at the previous-to-current span: keep if delta > ε
-        if abs(x - prev_x) > epsilon or idx == valid_idx[-1]:
+        if abs(x - keyframes[-1][1]) > epsilon or idx == valid_idx[-1]:
             keyframes.append((t, x))
 
-    # Range check → static single mode
     xs_only = [x for (_, x) in keyframes]
     rng_val = max(xs_only) - min(xs_only)
+    # If after smoothing the range is small, fall back to single static
     if rng_val < 25:
         avg_x = max(0, min(int(statistics.mean(xs_only)), max_crop_x))
+        print(f"    📷 Smoothed range only {rng_val}px — falling back to single (x={avg_x})")
         return {"mode": "single", "crop_x": avg_x}
 
-    print(f"    📹 Tracking: {len(keyframes)} keyframes, x range {rng_val}px")
+    print(f"    📹 Tracking: {len(keyframes)} keyframes, range {rng_val}px")
     return {"mode": "tracking", "keyframes": keyframes}
 
 

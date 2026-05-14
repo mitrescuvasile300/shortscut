@@ -543,6 +543,56 @@ export async function planClipCropFromFrames(
   // ── Pass 3: temporal outlier rejection ─────────────────────────────
   const cleaned = rejectOutliers(rawPrimaryX);
 
+  // ── Pass 3.5: DEFAULT-STATIC-FIRST CHECK ───────────────────────────
+  // User spec: "default to static centered crop; only move the camera
+  // when the face goes more than half off-screen."
+  //
+  //   1. Compute the optimal static crop position: median of all valid
+  //      face X positions, biased by 0.45 × cropWidth (upper-third).
+  //   2. Count what fraction of valid samples have the face center
+  //      OUTSIDE the resulting crop window [cropX, cropX+cropWidth].
+  //      Face center outside window ⟺ more than half of the face is
+  //      off-screen.
+  //   3. If ≤ 15% of samples exit → emit a SINGLE static crop. The few
+  //      exit frames will clip the face partially — that's the user's
+  //      accepted tradeoff.
+  //   4. Else → fall through to tracking.
+  const validNorms: number[] = [];
+  for (const v of cleaned) if (v !== null) validNorms.push(v);
+  if (validNorms.length >= 2) {
+    const medianFaceNorm = median(validNorms);
+    const medianFacePx = medianFaceNorm * videoWidth;
+    let staticCropX = Math.round(medianFacePx - cropWidth * 0.45);
+    staticCropX = clamp(staticCropX, 0, maxCropX);
+    let exits = 0;
+    for (const v of validNorms) {
+      const facePx = v * videoWidth;
+      if (facePx < staticCropX || facePx > staticCropX + cropWidth) exits++;
+    }
+    const exitFraction = exits / validNorms.length;
+    const STATIC_THRESHOLD = 0.15;
+    if (exitFraction <= STATIC_THRESHOLD) {
+      console.log(
+        `[faceDetection] Static single (x=${staticCropX}, exit=${(exitFraction * 100).toFixed(0)}% ≤ 15%)`,
+      );
+      return {
+        segments: [
+          {
+            startTime: 0,
+            endTime: duration,
+            mode: "single",
+            cropX: staticCropX,
+          },
+        ],
+        videoWidth,
+        videoHeight,
+      };
+    }
+    console.log(
+      `[faceDetection] Engaging tracking (${(exitFraction * 100).toFixed(0)}% of frames have face outside static crop)`,
+    );
+  }
+
   // ── Pass 4: gap fill (short gaps only, linear interpolation) ───────
   // HARD-RESET MARKERS: gaps longer than 0.75s mark a "discontinuity" —
   // the camera state should reset rather than EMA-into-a-stale-position
@@ -873,80 +923,85 @@ function fillShortGaps(
 }
 
 /**
- * Two-person dual decision. Works in NORMALIZED 0..1 coordinates so it's
- * agnostic to canvas resolution; result is rescaled to source pixels.
+ * Decide if the clip is a real two-person wide shot.
+ *
+ * Constraints (ALL must hold simultaneously, in ≥85% of detection frames):
+ *   - Two faces visible in the SAME frame
+ *   - Separated horizontally by ≥ 0.8 × cropWidth (else they'd fit in one crop)
+ *   - At SIMILAR Y position (within 25% of frame height). Kills the common
+ *     comedian-on-stage + audience-in-front-rows false positive.
+ *   - SIMILAR SIZE (max/min area ratio ≤ 2.0). Same camera distance.
+ *
+ * Returns face1X/face2X in SOURCE pixels (what videoProcessor renders).
  */
 function decideDual(
   framesFaces: FaceInfo[][],
   videoWidth: number,
   cropW: number,
 ): { face1X: number; face2X: number } | null {
-  // Separation threshold normalized: face centers must be ≥80% of a 9:16
-  // crop apart in the frame
   const minSepNorm = (cropW * 0.8) / videoWidth;
+  const Y_TOLERANCE = 0.25; // normalized canvas-height fraction
+  const SIZE_RATIO_MAX = 2.0;
+  const CONSISTENCY_THRESHOLD = 0.85;
+
+  // Estimate canvas dimensions from the max face bbox extents across the clip
+  // (face boxes approach but don't exceed canvas borders). All FaceInfo
+  // coordinates use the same canvas, so a single estimate suffices.
+  let estCanvasW = 0;
+  let estCanvasH = 0;
+  for (const faces of framesFaces) {
+    for (const f of faces) {
+      const r = f.centerX + f.width / 2;
+      const b = f.centerY + f.height / 2;
+      if (r > estCanvasW) estCanvasW = r;
+      if (b > estCanvasH) estCanvasH = b;
+    }
+  }
+  // Add 5% safety margin — faces don't reach the very edge of frame
+  estCanvasW = Math.max(estCanvasW * 1.05, 1);
+  estCanvasH = Math.max(estCanvasH * 1.05, 1);
 
   let framesWithAny = 0;
   let framesWithDual = 0;
-  const leftsNorm: number[] = [];
-  const rightsNorm: number[] = [];
+  const validLeftsNorm: number[] = [];
+  const validRightsNorm: number[] = [];
 
   for (const faces of framesFaces) {
     if (faces.length === 0) continue;
     framesWithAny++;
     if (faces.length < 2) continue;
-    // We need each frame's canvas width to normalize, but FaceInfo doesn't
-    // carry it. The detector receives canvas-relative coords, and we only
-    // care about a SEPARATION ratio, so it suffices to find the largest
-    // face's reference: use the max centerX across this frame as an
-    // approximation of "near right edge of frame" — but that's brittle.
-    //
-    // Cleaner: since all faces in the same frame share the same canvas,
-    // we can normalize by max(centerX, w) within that frame; but again
-    // brittle. So instead, this function ASSUMES all canvases are
-    // consistent resolution and uses the running max centerX over the
-    // entire clip as the canvas width estimate. Detector boxes can extend
-    // to 95-99% of frame width, so this is within ~1% of the real value.
-    const sorted = [...faces].sort((a, b) => a.centerX - b.centerX);
-    leftsNorm.push(sorted[0].centerX);
-    rightsNorm.push(sorted[sorted.length - 1].centerX);
+    // Filter tiny detections (canvas-relative width < 3%)
+    const big = faces.filter(
+      f => f.width / estCanvasW > 0.03 && f.height / estCanvasH > 0.03,
+    );
+    if (big.length < 2) continue;
+    const sorted = [...big].sort((a, b) => a.centerX - b.centerX);
+    const left = sorted[0];
+    const right = sorted[sorted.length - 1];
+    // Horizontal separation constraint
+    const sepNorm = (right.centerX - left.centerX) / estCanvasW;
+    if (sepNorm < minSepNorm) continue;
+    // Y position constraint (kills comedian+audience)
+    const dyNorm = Math.abs(left.centerY - right.centerY) / estCanvasH;
+    if (dyNorm > Y_TOLERANCE) continue;
+    // Size constraint
+    const aL = left.width * left.height;
+    const aR = right.width * right.height;
+    if (aL <= 0 || aR <= 0) continue;
+    const sizeRatio = Math.max(aL, aR) / Math.min(aL, aR);
+    if (sizeRatio > SIZE_RATIO_MAX) continue;
+    framesWithDual++;
+    validLeftsNorm.push(left.centerX / estCanvasW);
+    validRightsNorm.push(right.centerX / estCanvasW);
   }
-  if (framesWithAny === 0 || leftsNorm.length === 0) return null;
 
-  // Estimate canvas width from the max observed right-edge across the clip
-  // (faces near the edge approach but don't exceed canvas width).
-  let estCanvasW = 0;
-  for (const faces of framesFaces) {
-    for (const f of faces) {
-      const r = f.centerX + f.width / 2;
-      if (r > estCanvasW) estCanvasW = r;
-    }
-  }
-  // Add a small safety margin: real canvas is at least 5% wider than the
-  // rightmost detected face center (faces don't usually reach the very edge).
-  estCanvasW = Math.max(estCanvasW * 1.05, 1);
-
-  // Now compute separation in normalized units
-  const validLefts: number[] = [];
-  const validRights: number[] = [];
-  for (let i = 0; i < leftsNorm.length; i++) {
-    const sepNorm = (rightsNorm[i] - leftsNorm[i]) / estCanvasW;
-    if (sepNorm >= minSepNorm) {
-      framesWithDual++;
-      validLefts.push(leftsNorm[i] / estCanvasW);
-      validRights.push(rightsNorm[i] / estCanvasW);
-    }
-  }
   if (framesWithAny === 0) return null;
-  // Stricter threshold (was 0.6): unless the clip is *consistently* a
-  // two-person wide shot, we'd rather track one speaker than emit a
-  // split-screen that includes B-roll/cutaway single-person frames.
-  if (framesWithDual / framesWithAny < 0.85) return null;
-  if (validLefts.length < 3) return null;
+  if (framesWithDual / framesWithAny < CONSISTENCY_THRESHOLD) return null;
+  if (validLeftsNorm.length < 3) return null;
 
-  // Return in SOURCE pixels (what videoProcessor expects)
   return {
-    face1X: median(validLefts) * videoWidth,
-    face2X: median(validRights) * videoWidth,
+    face1X: median(validLeftsNorm) * videoWidth,
+    face2X: median(validRightsNorm) * videoWidth,
   };
 }
 
