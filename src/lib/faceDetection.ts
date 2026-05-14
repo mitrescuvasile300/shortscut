@@ -97,6 +97,8 @@ interface FaceInfo {
   centerY: number;
   width: number;
   height: number;
+  area: number; // width*height normalized by frame area
+  confidence: number;
 }
 
 interface FrameSample {
@@ -111,10 +113,11 @@ interface FrameSample {
 export interface CropSegment {
   startTime: number; // relative to clip start (NOT source start)
   endTime: number; // relative to clip start
-  mode: "single" | "dual" | "center";
+  mode: "single" | "dual" | "center" | "tracking";
   cropX?: number; // for single/center
-  face1X?: number; // for dual (pixels)
-  face2X?: number; // for dual (pixels)
+  face1X?: number; // for dual (normalized 0-1)
+  face2X?: number; // for dual (normalized 0-1)
+  keyframes?: Array<{ t: number; x: number }>; // for tracking mode
 }
 
 export interface CropPlan {
@@ -313,73 +316,31 @@ async function detectFacesInFrame(
   const minPxW = 30;
   const minPxH = 30;
 
+  const frameArea = canvas.width * canvas.height || 1;
   const out: FaceInfo[] = [];
   const res = short.detect(canvas);
   for (const d of res.detections) {
     const bb = d.boundingBox;
     if (!bb || bb.width < minPxW || bb.height < minPxH) continue;
+    const conf = d.categories?.[0]?.score ?? 0.5;
     out.push({
       centerX: bb.originX + bb.width / 2,
       centerY: bb.originY + bb.height / 2,
       width: bb.width,
       height: bb.height,
+      area: (bb.width * bb.height) / frameArea,
+      confidence: conf,
     });
   }
 
   return out;
 }
 
-// ── Clustering ─────────────────────────────────────────────────────────
-// ── Scene-cut detection from signatures ────────────────────────────────
-/**
- * Given 8×8 luminance signatures sampled across the clip, find time indices
- * where the frame content changed sharply. Returns segment boundaries
- * (indices into the samples array) so each segment can be analyzed separately.
- *
- * Threshold tuned empirically for talking-head / podcast / vlog content.
- */
-function findSceneBoundaries(signatures: (Uint8Array | null)[]): number[] {
-  // L1 distance between consecutive signatures, normalized per cell
-  const diffs: number[] = [];
-  for (let i = 1; i < signatures.length; i++) {
-    const a = signatures[i - 1];
-    const b = signatures[i];
-    if (!a || !b) {
-      diffs.push(0);
-      continue;
-    }
-    let d = 0;
-    for (let k = 0; k < a.length; k++) d += Math.abs(a[k] - b[k]);
-    diffs.push(d / a.length); // 0..255
-  }
-
-  // A scene cut produces a large diff. We use the higher of:
-  //   - absolute floor (30 / 255 ≈ 12% mean luminance shift)
-  //   - 3× median diff (robust against gradual lighting changes)
-  if (diffs.length === 0) return [0, signatures.length];
-  const sorted = [...diffs].sort((a, b) => a - b);
-  const median = sorted[Math.floor(sorted.length / 2)] || 1;
-  const threshold = Math.max(30, median * 3);
-
-  const boundaries: number[] = [0];
-  for (let i = 0; i < diffs.length; i++) {
-    if (diffs[i] >= threshold) {
-      // Cut between sample i and i+1 → boundary at i+1
-      const b = i + 1;
-      // Avoid tiny segments
-      if (b - boundaries[boundaries.length - 1] >= 2) boundaries.push(b);
-    }
-  }
-  if (boundaries[boundaries.length - 1] !== signatures.length) {
-    boundaries.push(signatures.length);
-  }
-  return boundaries;
-}
-
 // ── Main entry: plan crops for a clip ──────────────────────────────────
 /**
- * Build a crop plan for a single clip. May return multiple segments if
- * scene cuts are detected within the clip.
+ * Build a crop plan for a single clip. Uses deadzone + EMA tracking
+ * with primary face selection, MAD outlier rejection, velocity cap,
+ * and RDP keyframe reduction.
  *
  * @param videoBlobUrl  blob URL of the source video
  * @param clipStartTime seconds in source video
@@ -394,44 +355,37 @@ export async function planClipCrop(
   videoWidth: number,
   videoHeight: number,
 ): Promise<CropPlan> {
-  // 9:16 crop width
   const cropWidth = Math.round((videoHeight * 9) / 16);
   const clipDuration = clipEndTime - clipStartTime;
 
-  // If already narrow enough, just center
   if (cropWidth >= videoWidth) {
     return {
       segments: [
-        {
-          startTime: 0,
-          endTime: clipDuration,
-          mode: "center",
-          cropX: 0,
-        },
+        { startTime: 0, endTime: clipDuration, mode: "center", cropX: 0 },
       ],
       videoWidth,
       videoHeight,
     };
   }
 
-  // Adaptive sample count: ≥10, ~1 per 2s, cap 30
-  const sampleCount = Math.max(10, Math.min(30, Math.ceil(clipDuration / 2)));
+  // ── Adaptive sampling: 4fps ≤60s, 2fps ≤120s, 1fps beyond ──
+  const sampleFps =
+    clipDuration <= 60 ? 4 : clipDuration <= 120 ? 2 : 1;
+  const sampleCount = Math.max(
+    10,
+    Math.min(120, Math.ceil(clipDuration * sampleFps)),
+  );
+  const frameInterval = clipDuration / sampleCount;
 
   const extractor = new FrameExtractor(videoBlobUrl, videoWidth, videoHeight);
   await extractor.waitReady();
 
-  // Sample: evenly spaced, with margins inside the clip
   const sampleTimes: number[] = [];
   for (let i = 0; i < sampleCount; i++) {
-    const t = clipStartTime + ((i + 0.5) / sampleCount) * clipDuration;
-    sampleTimes.push(t);
+    sampleTimes.push(clipStartTime + ((i + 0.5) / sampleCount) * clipDuration);
   }
 
-  // Pass 1: extract signatures + face detections in one go.
-  // We can't easily parallelize seeks within one <video>, so do sequentially.
   const frames: FrameSample[] = [];
-  const sigs: (Uint8Array | null)[] = [];
-  // Scratch canvas reused across frames for face detection
   const scratch = document.createElement("canvas");
   scratch.width = videoWidth;
   scratch.height = videoHeight;
@@ -441,14 +395,9 @@ export async function planClipCrop(
       const t = sampleTimes[i];
       const img = await extractor.grab(t);
       if (!img) {
-        sigs.push(null);
         frames.push({ time: t - clipStartTime, faces: [] });
         continue;
       }
-      // Signature for scene detection: cheap 8×8 luma grid
-      const sig = imageDataToSig(img, 8);
-      sigs.push(sig);
-      // Face detection (writes img into scratch internally)
       const faces = await detectFacesInFrame(img, scratch);
       frames.push({ time: t - clipStartTime, faces });
     }
@@ -456,130 +405,233 @@ export async function planClipCrop(
     extractor.dispose();
   }
 
-  // Detect scene boundaries (indices into frames/sigs)
-  const boundaries = findSceneBoundaries(sigs);
+  const nDetected = frames.filter((f) => f.faces.length > 0).length;
+  if (nDetected < 2) {
+    return {
+      segments: [
+        {
+          startTime: 0,
+          endTime: clipDuration,
+          mode: "center",
+          cropX: Math.round((videoWidth - cropWidth) / 2),
+        },
+      ],
+      videoWidth,
+      videoHeight,
+    };
+  }
 
-  // For each segment, determine crop mode by analysing per-frame face hits
-  const segments: CropSegment[] = [];
-  for (let s = 0; s < boundaries.length - 1; s++) {
-    const a = boundaries[s];
-    const b = boundaries[s + 1];
-    const segFrames = frames.slice(a, b);
-    const segStart = frames[a].time;
-    const segEnd = b < frames.length ? frames[b].time : clipDuration;
+  // ── DUAL detection: ≥2 faces in SAME frame, wide separation ──
+  const validDuals: Array<{ f1: number; f2: number }> = [];
+  for (const f of frames) {
+    if (f.faces.length < 2) continue;
+    const xs = f.faces.map((fc) => fc.centerX).sort((a, b) => a - b);
+    if (xs[xs.length - 1] - xs[0] > cropWidth * 0.7) {
+      validDuals.push({ f1: xs[0], f2: xs[xs.length - 1] });
+    }
+  }
+  if (validDuals.length >= Math.max(3, frames.length * 0.15)) {
+    const f1s = validDuals.map((d) => d.f1).sort((a, b) => a - b);
+    const f2s = validDuals.map((d) => d.f2).sort((a, b) => a - b);
+    return {
+      segments: [
+        {
+          startTime: 0,
+          endTime: clipDuration,
+          mode: "dual",
+          face1X: f1s[Math.floor(f1s.length / 2)] / videoWidth,
+          face2X: f2s[Math.floor(f2s.length / 2)] / videoWidth,
+        },
+      ],
+      videoWidth,
+      videoHeight,
+    };
+  }
 
-    // ── DUAL detection: at least 2 faces visible *simultaneously* in a frame,
-    //    separated by > 70% of crop width (rules out false double-detections)
-    const dualFrames = segFrames.filter((f) => f.faces.length >= 2);
-    const validDuals = dualFrames.filter((f) => {
-      const xs = [...f.faces].map((fc) => fc.centerX).sort((m, n) => m - n);
-      return xs[xs.length - 1] - xs[0] > cropWidth * 0.7;
-    });
+  // ── Primary face selection: score = area × confidence × proximity ──
+  const sigma = (0.3 * cropWidth) / videoWidth; // Gaussian σ (normalized)
+  let prevX: number | null = null;
+  const primarySeries: (number | null)[] = [];
 
-    // Require solid evidence: ≥15% of sampled frames (min 3) must show valid dual
-    if (validDuals.length >= Math.max(3, segFrames.length * 0.15)) {
-      const f1List = validDuals
-        .map((f) => Math.min(...f.faces.map((x) => x.centerX)))
-        .sort((x, y) => x - y);
-      const f2List = validDuals
-        .map((f) => Math.max(...f.faces.map((x) => x.centerX)))
-        .sort((x, y) => x - y);
-
-      const face1Median = f1List[Math.floor(f1List.length / 2)];
-      const face2Median = f2List[Math.floor(f2List.length / 2)];
-
-      segments.push({
-        startTime: segStart,
-        endTime: segEnd,
-        mode: "dual",
-        face1X: face1Median / videoWidth,
-        face2X: face2Median / videoWidth,
-      });
+  for (const f of frames) {
+    if (f.faces.length === 0) {
+      primarySeries.push(null);
       continue;
     }
+    let bestFace: FaceInfo | null = null;
+    let bestScore = -1;
+    for (const face of f.faces) {
+      let score = face.area * face.confidence;
+      if (prevX !== null) {
+        const dist = Math.abs(face.centerX / videoWidth - prevX);
+        score *= Math.exp(-(dist * dist) / (2 * sigma * sigma));
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestFace = face;
+      }
+    }
+    const normX = bestFace!.centerX / videoWidth;
+    primarySeries.push(normX);
+    prevX = normX;
+  }
 
-    // ── SINGLE mode: median of ALL face X positions across every frame in segment
-    const flatXs = segFrames.flatMap((f) => f.faces.map((x) => x.centerX));
-
-    if (flatXs.length > 0) {
-      flatXs.sort((x, y) => x - y);
-      const medianX = flatXs[Math.floor(flatXs.length / 2)];
-      let cropX = Math.round(medianX - cropWidth * 0.5);
-      cropX = Math.max(0, Math.min(cropX, videoWidth - cropWidth));
-
-      segments.push({
-        startTime: segStart,
-        endTime: segEnd,
-        mode: "single",
-        cropX,
-      });
-    } else {
-      // No faces at all → center fallback
-      segments.push({
-        startTime: segStart,
-        endTime: segEnd,
-        mode: "center",
-        cropX: (videoWidth - cropWidth) / 2,
-      });
+  // ── MAD-based temporal outlier rejection ──
+  const cleaned = [...primarySeries];
+  for (let i = 0; i < cleaned.length; i++) {
+    if (cleaned[i] === null) continue;
+    const window: number[] = [];
+    for (let j = Math.max(0, i - 2); j <= Math.min(cleaned.length - 1, i + 2); j++) {
+      if (cleaned[j] !== null) window.push(cleaned[j]!);
+    }
+    if (window.length < 3) continue;
+    window.sort((a, b) => a - b);
+    const localMed = window[Math.floor(window.length / 2)];
+    const devs = window.map((v) => Math.abs(v - localMed)).sort((a, b) => a - b);
+    const mad = devs[Math.floor(devs.length / 2)];
+    if (Math.abs(cleaned[i]! - localMed) > 3 * mad + 0.02) {
+      cleaned[i] = null; // reject outlier
     }
   }
 
-  // Merge adjacent identical segments (e.g. same single crop across cuts)
-  const merged: CropSegment[] = [];
-  for (const seg of segments) {
-    const last = merged[merged.length - 1];
-    if (
-      last &&
-      last.mode === seg.mode &&
-      same(last.cropX, seg.cropX) &&
-      same(last.face1X, seg.face1X) &&
-      same(last.face2X, seg.face2X)
-    ) {
-      last.endTime = seg.endTime;
-    } else {
-      merged.push({ ...seg });
+  // ── Gap-fill: ≤1.5s nearest-neighbor, >1.5s → center fallback ──
+  const maxGapFrames = Math.ceil(1.5 * sampleFps);
+  const filled = [...cleaned];
+  // Forward fill (limited)
+  let lastVal: number | null = null;
+  let lastIdx = -999;
+  for (let i = 0; i < filled.length; i++) {
+    if (filled[i] !== null) {
+      lastVal = filled[i];
+      lastIdx = i;
+    } else if (lastVal !== null && i - lastIdx <= maxGapFrames) {
+      filled[i] = lastVal;
     }
   }
+  // Backward fill (limited)
+  lastVal = null;
+  lastIdx = filled.length + 999;
+  for (let i = filled.length - 1; i >= 0; i--) {
+    if (filled[i] !== null) {
+      lastVal = filled[i];
+      lastIdx = i;
+    } else if (lastVal !== null && lastIdx - i <= maxGapFrames) {
+      filled[i] = lastVal;
+    }
+  }
+  // Remaining nulls → center
+  const centerNorm = 0.5;
+  const filledFinal = filled.map((v) => v ?? centerNorm);
 
+  // ── Deadzone + EMA tracking ──
+  const dzW = (cropWidth * 0.12) / videoWidth; // deadzone half-width (normalized)
+  const alpha = 0.30; // EMA at ~4fps → τ ≈ 0.70s
+  const maxPanPerFrame = ((0.30 * cropWidth) / videoWidth) * frameInterval; // velocity cap
+
+  let camX = filledFinal[0];
+  const smoothed: number[] = [];
+
+  for (const headPos of filledFinal) {
+    let targ: number;
+    if (headPos > camX + dzW) {
+      targ = headPos; // face exited right → full follow
+    } else if (headPos < camX - dzW) {
+      targ = headPos; // face exited left → full follow
+    } else {
+      targ = camX; // inside deadzone → stay put
+    }
+
+    let desired = alpha * targ + (1 - alpha) * camX;
+    // Velocity cap
+    const delta = desired - camX;
+    if (Math.abs(delta) > maxPanPerFrame) {
+      desired = camX + maxPanPerFrame * (delta > 0 ? 1 : -1);
+    }
+    camX = desired;
+    smoothed.push(camX);
+  }
+
+  // ── Convert to pixel crop positions with 0.45 bias ──
+  const maxCropX = videoWidth - cropWidth;
+  const cropPositions = smoothed.map((focus) => {
+    let cx = Math.round(focus * videoWidth - cropWidth * 0.45);
+    cx = Math.max(0, Math.min(cx, maxCropX));
+    return cx;
+  });
+
+  // ── RDP keyframe reduction ──
+  const epsilon = Math.max(5, Math.round(0.008 * cropWidth));
+  const timed: Array<{ t: number; x: number }> = cropPositions.map(
+    (x, i) => ({ t: i * frameInterval, x }),
+  );
+
+  function rdpSimplify(
+    points: Array<{ t: number; x: number }>,
+    eps: number,
+  ): Array<{ t: number; x: number }> {
+    if (points.length <= 2) return points;
+    const start = points[0];
+    const end = points[points.length - 1];
+    const dt = end.t - start.t;
+    const dx = end.x - start.x;
+    const lineLen = Math.sqrt(dt * dt + dx * dx) || 1e-9;
+    let maxDist = 0;
+    let maxIdx = 0;
+    for (let i = 1; i < points.length - 1; i++) {
+      const d =
+        Math.abs(
+          dx * (start.t - points[i].t) - dt * (start.x - points[i].x),
+        ) / lineLen;
+      if (d > maxDist) {
+        maxDist = d;
+        maxIdx = i;
+      }
+    }
+    if (maxDist > eps) {
+      const left = rdpSimplify(points.slice(0, maxIdx + 1), eps);
+      const right = rdpSimplify(points.slice(maxIdx), eps);
+      return [...left.slice(0, -1), ...right];
+    }
+    return [start, end];
+  }
+
+  const keyframes = rdpSimplify(timed, epsilon);
+
+  // ── Mode decision: range < 25px → static single ──
+  const xValues = keyframes.map((kf) => kf.x);
+  const rng = Math.max(...xValues) - Math.min(...xValues);
+
+  if (rng < 25) {
+    const avgX = Math.round(
+      xValues.reduce((s, v) => s + v, 0) / xValues.length,
+    );
+    return {
+      segments: [
+        {
+          startTime: 0,
+          endTime: clipDuration,
+          mode: "single",
+          cropX: Math.max(0, Math.min(avgX, maxCropX)),
+        },
+      ],
+      videoWidth,
+      videoHeight,
+    };
+  }
+
+  // ── Return tracking segment with keyframes ──
   return {
-    segments: merged,
+    segments: [
+      {
+        startTime: 0,
+        endTime: clipDuration,
+        mode: "tracking",
+        keyframes,
+      },
+    ],
     videoWidth,
     videoHeight,
   };
-}
-
-function same(a: number | undefined, b: number | undefined): boolean {
-  if (a === undefined && b === undefined) return true;
-  if (a === undefined || b === undefined) return false;
-  // Within 10 px → consider equal
-  return Math.abs(a - b) < 10;
-}
-
-// Pure helper (no canvas / async needed)
-function imageDataToSig(img: ImageData, grid = 8): Uint8Array {
-  const sig = new Uint8Array(grid * grid);
-  const cellW = img.width / grid;
-  const cellH = img.height / grid;
-  const data = img.data;
-  for (let gy = 0; gy < grid; gy++) {
-    for (let gx = 0; gx < grid; gx++) {
-      const x0 = Math.floor(gx * cellW);
-      const y0 = Math.floor(gy * cellH);
-      const x1 = Math.floor((gx + 1) * cellW);
-      const y1 = Math.floor((gy + 1) * cellH);
-      let sum = 0;
-      let n = 0;
-      for (let y = y0; y < y1; y += 4) {
-        for (let x = x0; x < x1; x += 4) {
-          const i = (y * img.width + x) * 4;
-          sum += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-          n++;
-        }
-      }
-      sig[gy * grid + gx] = Math.round(sum / Math.max(n, 1));
-    }
-  }
-  return sig;
 }
 
 // ── Cleanup ────────────────────────────────────────────────────────────
@@ -640,6 +692,11 @@ export async function detectFaceCropPosition(
       let cx = Math.round(mid - cropWidth / 2);
       cx = Math.max(0, Math.min(cx, width - cropWidth));
       return { cropX: cx, method: "dual→single (legacy)" };
+    }
+    if (best.mode === "tracking" && best.keyframes && best.keyframes.length > 0) {
+      // Legacy path: use median keyframe position
+      const xs = best.keyframes.map((kf) => kf.x).sort((a, b) => a - b);
+      return { cropX: xs[Math.floor(xs.length / 2)], method: "tracking→single (legacy)" };
     }
     return {
       cropX: best.cropX ?? Math.round((width - cropWidth) / 2),

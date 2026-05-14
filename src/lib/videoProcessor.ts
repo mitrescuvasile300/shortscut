@@ -190,6 +190,33 @@ function buildFilters(
   const cropW = Math.round((srcH * 9) / 16);
   const cropH = srcH;
 
+  // Fast path: tracking mode → ffmpeg expression for dynamic crop X
+  if (segments.length === 1 && segments[0].mode === "tracking" && segments[0].keyframes) {
+    const kfs = segments[0].keyframes;
+    const maxCropX = srcW - cropW;
+    let expr = String(Math.round(kfs[kfs.length - 1].x));
+    for (let i = kfs.length - 2; i >= 0; i--) {
+      const { t: t0, x: x0 } = kfs[i];
+      const { t: t1, x: x1 } = kfs[i + 1];
+      const dt = t1 - t0;
+      let seg: string;
+      if (dt < 0.01 || Math.abs(x1 - x0) < 3) {
+        seg = String(Math.round(x0));
+      } else {
+        const dx = Math.round(x1 - x0);
+        const base = Math.round(x0);
+        seg = dx >= 0
+          ? `${base}+${dx}*(t-${t0.toFixed(2)})/${dt.toFixed(2)}`
+          : `${base}-${Math.abs(dx)}*(t-${t0.toFixed(2)})/${dt.toFixed(2)}`;
+      }
+      expr = `if(lt(t\\,${t1.toFixed(2)})\\,${seg}\\,${expr})`;
+    }
+    expr = `clip(${expr}\\,0\\,${maxCropX})`;
+    const base = `crop=${cropW}:${cropH}:'${expr}':0,scale=${outW}:${outH}`;
+    const vf = hasSubs ? `${base},ass=subs.ass` : base;
+    return { vf };
+  }
+
   // Fast path: one segment, single mode (or center) → plain -vf
   if (segments.length === 1 && segments[0].mode !== "dual") {
     const seg = segments[0];
