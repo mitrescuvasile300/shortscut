@@ -18,8 +18,9 @@ import {
   type CropSegment,
   disposeFaceDetector,
   getVideoDimensions,
-  planClipCrop,
+  planClipCropFromFrames,
   prewarmFaceDetector,
+  type TrackingKeyframe,
 } from "./faceDetection";
 
 let ffmpegInstance: FFmpeg | null = null;
@@ -169,12 +170,80 @@ function formatTime(seconds: number): string {
 }
 
 // ── Filter construction ────────────────────────────────────────────────
+
+/**
+ * Build a piecewise-linear ffmpeg `crop` X expression from keyframes.
+ *
+ * Keyframes are in segment-relative time (t=0 at segment start).
+ * Caller passes `tOffset` = segment-start in clip time, because the
+ * `crop` filter receives clip-time `t` (the outer ffmpeg already trims
+ * the input to [clip.startTime, clip.endTime]).
+ *
+ * Output (for keyframes (s0,x0)..(sN,xN), with absolute times Ti = sI+tOffset):
+ *   if(lt(t,T1), x0 + (t-T0)/(T1-T0)*(x1-x0),
+ *     if(lt(t,T2), x1 + (t-T1)/(T2-T1)*(x2-x1),
+ *       ...
+ *         xN))
+ *
+ * For t < T0 the expression naturally evaluates to the first branch,
+ * which extrapolates linearly toward x0 — but since the outer trim
+ * filter discards those frames anyway, it doesn't matter.
+ *
+ * Clamp the produced expression to [0, srcW-cropW] via `clip(...)` so
+ * we never produce an out-of-bounds crop X if floats drift.
+ *
+ * Caller must wrap the returned expression in single quotes when using it
+ * in either -vf or filter_complex (commas inside if(...) would otherwise
+ * be parsed as filter-chain separators).
+ */
+function buildTrackingExpr(
+  keyframes: TrackingKeyframe[],
+  tOffset: number,
+  srcW: number,
+  cropW: number,
+): string {
+  const maxCropX = srcW - cropW;
+  if (keyframes.length === 0) {
+    return String(Math.round(maxCropX / 2));
+  }
+  if (keyframes.length === 1) {
+    const x = Math.max(0, Math.min(Math.round(keyframes[0].x), maxCropX));
+    return String(x);
+  }
+
+  // Absolute times (clip-relative)
+  const T = keyframes.map(k => k.t + tOffset);
+  const X = keyframes.map(k => Math.round(k.x));
+
+  // Build nested if() from the right: start with the last x, then wrap.
+  let expr = String(X[X.length - 1]);
+  for (let i = T.length - 2; i >= 0; i--) {
+    const t0 = T[i].toFixed(4);
+    const t1 = T[i + 1].toFixed(4);
+    const x0 = X[i];
+    const x1 = X[i + 1];
+    const dx = x1 - x0;
+    const dt = T[i + 1] - T[i];
+    if (dt <= 0 || dx === 0) {
+      // Degenerate segment: hold x0 until next
+      expr = `if(lt(t,${t1}),${x0},${expr})`;
+    } else {
+      // x0 + (t - t0) * (dx/dt)
+      const slope = (dx / dt).toFixed(6);
+      expr = `if(lt(t,${t1}),${x0}+(t-${t0})*${slope},${expr})`;
+    }
+  }
+  // Final clip to bounds (commas inside clip() are fine — we single-quote
+  // the whole expression at the call site)
+  return `clip(${expr},0,${maxCropX})`;
+}
+
 /**
  * Build a -filter_complex string for a clip with a multi-segment plan.
  *
  * Strategy:
  *   - For each segment, build a separate filter chain (crop+scale, or
- *     split/crop/vstack for dual)
+ *     split/crop/vstack for dual, or crop=x='expr' for tracking)
  *   - Use `enable='between(t,a,b)'` so each only renders during its segment
  *   - Overlay them onto a black canvas to avoid frame ordering issues
  *
@@ -190,41 +259,28 @@ function buildFilters(
   const cropW = Math.round((srcH * 9) / 16);
   const cropH = srcH;
 
-  // Fast path: tracking mode → ffmpeg expression for dynamic crop X
-  if (segments.length === 1 && segments[0].mode === "tracking" && segments[0].keyframes) {
-    const kfs = segments[0].keyframes;
-    const maxCropX = srcW - cropW;
-    let expr = String(Math.round(kfs[kfs.length - 1].x));
-    for (let i = kfs.length - 2; i >= 0; i--) {
-      const { t: t0, x: x0 } = kfs[i];
-      const { t: t1, x: x1 } = kfs[i + 1];
-      const dt = t1 - t0;
-      let seg: string;
-      if (dt < 0.01 || Math.abs(x1 - x0) < 3) {
-        seg = String(Math.round(x0));
-      } else {
-        const dx = Math.round(x1 - x0);
-        const base = Math.round(x0);
-        seg = dx >= 0
-          ? `${base}+${dx}*(t-${t0.toFixed(2)})/${dt.toFixed(2)}`
-          : `${base}-${Math.abs(dx)}*(t-${t0.toFixed(2)})/${dt.toFixed(2)}`;
-      }
-      expr = `if(lt(t\\,${t1.toFixed(2)})\\,${seg}\\,${expr})`;
-    }
-    expr = `clip(${expr}\\,0\\,${maxCropX})`;
-    const base = `crop=${cropW}:${cropH}:'${expr}':0,scale=${outW}:${outH}`;
-    const vf = hasSubs ? `${base},ass=subs.ass` : base;
-    return { vf };
-  }
-
-  // Fast path: one segment, single mode (or center) → plain -vf
-  if (segments.length === 1 && segments[0].mode !== "dual") {
+  // Fast path: one segment, single/center → plain -vf with static crop
+  if (
+    segments.length === 1 &&
+    (segments[0].mode === "single" || segments[0].mode === "center")
+  ) {
     const seg = segments[0];
     const cropX =
       seg.cropX !== undefined
         ? Math.max(0, Math.min(seg.cropX, srcW - cropW))
         : Math.round((srcW - cropW) / 2);
     const base = `crop=${cropW}:${cropH}:${cropX}:0,scale=${outW}:${outH}`;
+    const vf = hasSubs ? `${base},ass=subs.ass` : base;
+    return { vf };
+  }
+
+  // Fast path: one segment, tracking → plain -vf with crop=x='expr'
+  if (segments.length === 1 && segments[0].mode === "tracking") {
+    const seg = segments[0];
+    const expr = buildTrackingExpr(seg.keyframes ?? [], 0, srcW, cropW);
+    // Quote the expression so ffmpeg parses it as a single argument
+    // (escape colons and commas inside it via \, already done in clip(...))
+    const base = `crop=${cropW}:${cropH}:'${expr}':0,scale=${outW}:${outH}`;
     const vf = hasSubs ? `${base},ass=subs.ass` : base;
     return { vf };
   }
@@ -292,6 +348,13 @@ function buildFilters(
         `;[s${i}a]crop=${dualCropW}:${cropH}:${cx1}:0,scale=${outW}:${halfH}[s${i}ac]` +
         `;[s${i}b]crop=${dualCropW}:${cropH}:${cx2}:0,scale=${outW}:${halfH}[s${i}bc]` +
         `;[s${i}ac][s${i}bc]vstack=inputs=2,setpts=PTS-STARTPTS[seg${i}]`;
+    } else if (seg.mode === "tracking") {
+      // Tracking: piecewise-linear crop=x='expr'. The expression sees clip-
+      // relative time `t` because the outer ffmpeg command already trims
+      // the source to [clip.startTime, clip.endTime]. We pass tOffset=t0
+      // so segment-relative keyframes are translated into clip-relative.
+      const expr = buildTrackingExpr(seg.keyframes ?? [], t0, srcW, cropW);
+      fc += `;[s${i}]crop=${cropW}:${cropH}:'${expr}':0,scale=${outW}:${outH},setpts=PTS-STARTPTS[seg${i}]`;
     } else {
       const cropX =
         seg.cropX !== undefined
@@ -318,6 +381,150 @@ function buildFilters(
 
 function clampCrop(x: number, srcW: number, cropW: number): number {
   return Math.max(0, Math.min(x, srcW - cropW));
+}
+
+// ── Frame-accurate sampling via ffmpeg.wasm ───────────────────────────
+/**
+ * Extract `fps` frames per second of clip duration as decoded image
+ * frames, using ffmpeg's `fps=N` filter (frame-accurate, deterministic).
+ *
+ * Why this instead of `<video>.currentTime`:
+ *   - Firefox: currentTime has ±2ms precision baseline, ±41ms with
+ *     fingerprinting protection enabled
+ *   - Chrome: known "drift" at start-of-video and on rapid seeks
+ *   - Safari: longstanding seek-accuracy bugs (WebKit #52697)
+ * The previous pipeline could produce staircase trajectories where two
+ * consecutive samples landed on the same source frame, then jumped two
+ * frames, which the smoothing pipeline dutifully followed → visible
+ * camera weirdness. ffmpeg's `fps` filter samples at exact intervals.
+ *
+ * Frames are downscaled to half-resolution for face detection: BlazeFace
+ * needs roughly 128-px faces in the input, so 960×540 of a 1080p source
+ * still contains plenty of detail for the model, and decode is 4× faster.
+ *
+ * RETURNS a lazy provider — caller asks for frame `i` one at a time, and
+ * each canvas is garbage-collectable after the call. This keeps peak
+ * memory around one canvas (~2 MB at 960×540) instead of N (480 MB for
+ * a 60s clip at 4 fps).
+ *
+ * The underlying JPEGs are pre-extracted into ffmpeg's MEMFS (small —
+ * ~80 kB each at q=5) and deleted after the caller signals done().
+ */
+async function extractFramesViaFfmpeg(
+  ffmpeg: FFmpeg,
+  startTime: number,
+  duration: number,
+  fps: number,
+  srcW: number,
+  srcH: number,
+): Promise<{
+  numFrames: number;
+  getFrame: (i: number) => Promise<HTMLCanvasElement | null>;
+  cleanup: () => Promise<void>;
+}> {
+  // Downscale only when the source is large (>1280 wide). For 720p/1080p
+  // we keep source resolution — BlazeFace works best on faces ≥40 px, and
+  // halving 1080p source would put marginal-distance faces below that.
+  // For 4K (3840) we downscale to 1280 (3× reduction, faces still ≥50 px
+  // for typical compositions) → keeps decode time bounded.
+  const TARGET_MAX_W = 1280;
+  let scaleW = srcW;
+  let scaleH = srcH;
+  if (srcW > TARGET_MAX_W) {
+    scaleW = TARGET_MAX_W;
+    scaleH = Math.round((TARGET_MAX_W / srcW) * srcH);
+    // Make sure height is even (some codecs require it; ffmpeg auto-rounds
+    // anyway but being explicit is cleaner)
+    if (scaleH % 2 === 1) scaleH -= 1;
+  }
+
+  // Sample directory in MEMFS
+  const dir = "samples";
+  try {
+    await ffmpeg.createDir(dir);
+  } catch {
+    /* already exists */
+  }
+  // Wipe any leftovers from a previous clip
+  try {
+    const existing = await ffmpeg.listDir(dir);
+    for (const node of existing) {
+      if (!node.isDir) {
+        await ffmpeg.deleteFile(`${dir}/${node.name}`).catch(() => {});
+      }
+    }
+  } catch {
+    /* dir didn't exist or was empty */
+  }
+
+  // -ss BEFORE -i = fast keyframe seek; we then -t for duration.
+  // The `fps` filter produces exactly N frames/sec, regardless of how
+  // the input GOP is structured.
+  await ffmpeg.exec([
+    "-ss",
+    startTime.toFixed(3),
+    "-i",
+    "source.mp4",
+    "-t",
+    duration.toFixed(3),
+    "-vf",
+    `fps=${fps},scale=${scaleW}:${scaleH}`,
+    "-q:v",
+    "5", // JPEG quality (1=best, 31=worst). 5 = high quality, small files.
+    "-an",
+    "-y",
+    `${dir}/f%04d.jpg`,
+  ]);
+
+  // List produced files (sorted alphabetically = sorted by frame number)
+  const nodes = await ffmpeg.listDir(dir);
+  const names = nodes
+    .filter(n => !n.isDir && n.name.startsWith("f") && n.name.endsWith(".jpg"))
+    .map(n => n.name)
+    .sort();
+
+  const getFrame = async (i: number): Promise<HTMLCanvasElement | null> => {
+    if (i < 0 || i >= names.length) return null;
+    const path = `${dir}/${names[i]}`;
+    try {
+      const data = await ffmpeg.readFile(path);
+      if (!(data instanceof Uint8Array)) return null;
+      const blob = new Blob([data.buffer as ArrayBuffer], {
+        type: "image/jpeg",
+      });
+      const bitmap = await createImageBitmap(blob);
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) {
+        bitmap.close();
+        return null;
+      }
+      ctx.drawImage(bitmap, 0, 0);
+      bitmap.close();
+      // Eagerly delete the source file once decoded — keeps MEMFS small
+      await ffmpeg.deleteFile(path).catch(() => {});
+      return canvas;
+    } catch {
+      return null;
+    }
+  };
+
+  const cleanup = async () => {
+    try {
+      const remaining = await ffmpeg.listDir(dir);
+      for (const node of remaining) {
+        if (!node.isDir) {
+          await ffmpeg.deleteFile(`${dir}/${node.name}`).catch(() => {});
+        }
+      }
+    } catch {
+      /* dir gone */
+    }
+  };
+
+  return { numFrames: names.length, getFrame, cleanup };
 }
 
 // ── Process a single clip ──────────────────────────────────────────────
@@ -557,7 +764,14 @@ export async function processAllClips(
   // Wait for pre-warm to be done so the first clip doesn't pay the load cost
   await prewarm;
 
-  // Face detection per clip (now produces a CropPlan)
+  // We need source.mp4 in ffmpeg's FS for both face-detection (frame extract)
+  // and the encode pass. Write once, before the detection loop.
+  await ffmpeg.writeFile("source.mp4", muxedData);
+
+  // Face detection per clip: extract frames via ffmpeg (frame-accurate)
+  // and feed them into planClipCropFromFrames. This replaces the previous
+  // <video>.currentTime seek-and-grab approach which has known accuracy
+  // issues across browsers (Firefox ±2ms, Chrome drift, Safari bugs).
   if (videoWidth > 0 && videoHeight > 0) {
     onProgress({
       clipIndex: 0,
@@ -577,27 +791,50 @@ export async function processAllClips(
         message: `🎯 Face detection ${i + 1}/${clips.length}: ${clip.title}`,
       });
       try {
-        const plan = await planClipCrop(
-          videoBlobUrl,
+        const duration = clip.endTime - clip.startTime;
+        // Adaptive sampling: 4 fps for short clips, 2 for medium, 1 for long
+        const fps = duration <= 60 ? 4 : duration <= 120 ? 2 : 1;
+        const { numFrames, getFrame, cleanup } = await extractFramesViaFfmpeg(
+          ffmpeg,
           clip.startTime,
-          clip.endTime,
+          duration,
+          fps,
           videoWidth,
           videoHeight,
         );
-        clip.cropPlan = plan;
-        const desc = plan.segments
-          .map(
-            (s: CropSegment) =>
-              `${s.mode}@${s.startTime.toFixed(1)}-${s.endTime.toFixed(1)}s${
-                s.mode === "single" ? `(x=${s.cropX})` : ""
-              }${
-                s.mode === "dual"
-                  ? `(f1=${Math.round(s.face1X ?? 0)},f2=${Math.round(s.face2X ?? 0)})`
-                  : ""
-              }`,
-          )
-          .join(" | ");
-        console.log(`[faceDetection] Clip ${i + 1} plan: ${desc}`);
+        try {
+          const plan = await planClipCropFromFrames({
+            frameProvider: getFrame,
+            numFrames,
+            fps,
+            clipStartTime: clip.startTime,
+            clipEndTime: clip.endTime,
+            videoWidth,
+            videoHeight,
+          });
+          clip.cropPlan = plan;
+          const desc = plan.segments
+            .map(
+              (s: CropSegment) =>
+                `${s.mode}@${s.startTime.toFixed(1)}-${s.endTime.toFixed(1)}s${
+                  s.mode === "single" ? `(x=${s.cropX})` : ""
+                }${
+                  s.mode === "dual"
+                    ? `(f1=${Math.round(s.face1X ?? 0)},f2=${Math.round(s.face2X ?? 0)})`
+                    : ""
+                }${
+                  s.mode === "tracking"
+                    ? `(${(s.keyframes ?? []).length}kf)`
+                    : ""
+                }`,
+            )
+            .join(" | ");
+          console.log(
+            `[faceDetection] Clip ${i + 1}: ${numFrames} frames @ ${fps}fps → ${desc}`,
+          );
+        } finally {
+          await cleanup();
+        }
       } catch (err) {
         console.warn(
           `[faceDetection] Clip ${i + 1} failed, will use center crop:`,
@@ -607,9 +844,6 @@ export async function processAllClips(
     }
   }
   disposeFaceDetector();
-
-  // Write source for processing
-  await ffmpeg.writeFile("source.mp4", muxedData);
 
   // Process each clip
   for (let i = 0; i < clips.length; i++) {
