@@ -289,8 +289,15 @@ async function detectFacesInCanvas(
     return out;
   };
 
+  // ALWAYS run both detectors and union the results. Profile-only frames
+  // (podcast/interview shots where speakers face each other in profile)
+  // are exactly where BlazeFace's confidence drops: one face often gets
+  // primary-detector confidence ≥0.5 while the other only clears the
+  // permissive 0.25 threshold. The previous "only run permissive if
+  // primary found <2" optimization defeated this case: it skipped the
+  // permissive pass on every frame where the primary detector found
+  // exactly one face, missing the second speaker entirely.
   const a = collect(primary);
-  if (a.length >= 2) return a;
   const b = collect(permissive);
   const merged = [...a];
   for (const f of b) {
@@ -542,6 +549,46 @@ export async function planClipCropFromFrames(
 
   // ── Pass 3: temporal outlier rejection ─────────────────────────────
   const cleaned = rejectOutliers(rawPrimaryX);
+
+  // ── Pass 3.25: BIMODALITY-BASED DUAL FALLBACK ──────────────────────
+  // Pass 2 (same-frame dual detection) requires both speakers visible
+  // simultaneously in ≥85% of detection frames. In real interview /
+  // podcast footage, this often misses dual mode because:
+  //   - Strict profile views drop BlazeFace confidence; one face is
+  //     detected per frame, alternating between speakers
+  //   - One speaker looks down at notes / laptop / mug periodically
+  // Result: primary-face track ping-pongs between two distant cluster
+  // centers, but neither speaker is "alone" in dual frames often enough
+  // to clear 85%.
+  //
+  // This pass catches that case: if the cleaned primary-X track is
+  // CLEANLY BIMODAL — two tight clusters separated by ≥0.30 of frame
+  // width, each cluster getting ≥25% of frames, each cluster σ < 0.05
+  // — AND the median face at each cluster passes the Y/size constraints
+  // already used in Pass 2, then it's a real dual scene.
+  const dualBimodal = decideDualByBimodality(
+    cleaned,
+    allFacesPerFrame,
+    videoWidth,
+  );
+  if (dualBimodal) {
+    console.log(
+      `[faceDetection] Dual (bimodal): f1=${Math.round(dualBimodal.face1X)}, f2=${Math.round(dualBimodal.face2X)}`,
+    );
+    return {
+      segments: [
+        {
+          startTime: 0,
+          endTime: duration,
+          mode: "dual",
+          face1X: dualBimodal.face1X,
+          face2X: dualBimodal.face2X,
+        },
+      ],
+      videoWidth,
+      videoHeight,
+    };
+  }
 
   // ── Pass 3.5: DEFAULT-STATIC-FIRST CHECK ───────────────────────────
   // User spec: "default to static centered crop; only move the camera
@@ -1002,6 +1049,139 @@ function decideDual(
   return {
     face1X: median(validLeftsNorm) * videoWidth,
     face2X: median(validRightsNorm) * videoWidth,
+  };
+}
+
+/**
+ * Bimodality-based dual decision: catches the profile-podcast case where
+ * Pass 2 fails because both faces are rarely detected simultaneously.
+ *
+ * Inputs:
+ *   - cleanedPrimaryX: per-frame normalized X of the primary face (after
+ *     outlier rejection), with `null` for frames where no face was found.
+ *   - allFacesPerFrame: full per-frame face list (for Y/size verification).
+ *   - videoWidth, cropW: source-resolution constants.
+ *
+ * Algorithm:
+ *   1. Collect valid primary-X values.
+ *   2. Run 1D k-means with k=2 (sort + try every split position; take the
+ *      one that minimizes total within-cluster variance).
+ *   3. Test the resulting partition for clean bimodality:
+ *        - cluster separation ≥ 0.30 (normalized frame width)
+ *        - each cluster has ≥ 25% of valid samples
+ *        - each cluster σ < 0.05 (faces are anchored, not wandering)
+ *   4. For each cluster, find the median Y and area of faces near that
+ *      cluster's X center (within ±0.05). Apply Pass-2's Y similarity
+ *      (|ΔY| ≤ 0.25) and size ratio (≤ 2.0) constraints.
+ *
+ * Returns null if any test fails.
+ */
+function decideDualByBimodality(
+  cleanedPrimaryX: (number | null)[],
+  allFacesPerFrame: FaceInfo[][],
+  videoWidth: number,
+): { face1X: number; face2X: number } | null {
+  const xs: number[] = [];
+  for (const v of cleanedPrimaryX) if (v !== null) xs.push(v);
+  if (xs.length < 8) return null; // need a minimum of frames to call bimodality
+
+  const sorted = [...xs].sort((a, b) => a - b);
+  const total = sorted.length;
+
+  // Find the split index that minimizes within-cluster sum of squared
+  // deviations (1D k-means optimum is always a contiguous split on sorted data)
+  let bestSplit = -1;
+  let bestSSE = Number.POSITIVE_INFINITY;
+  // Precompute prefix sums and prefix sums of squares for O(1) variance
+  const ps = new Float64Array(total + 1);
+  const pss = new Float64Array(total + 1);
+  for (let i = 0; i < total; i++) {
+    ps[i + 1] = ps[i] + sorted[i];
+    pss[i + 1] = pss[i] + sorted[i] * sorted[i];
+  }
+  const sseRange = (lo: number, hi: number): number => {
+    // SSE over sorted[lo..hi-1] = Σx² - (Σx)² / n
+    const n = hi - lo;
+    if (n <= 0) return 0;
+    const sum = ps[hi] - ps[lo];
+    const sumSq = pss[hi] - pss[lo];
+    return sumSq - (sum * sum) / n;
+  };
+  // Each side must have at least 25% of samples
+  const minSide = Math.max(2, Math.ceil(total * 0.25));
+  for (let split = minSide; split <= total - minSide; split++) {
+    const sse = sseRange(0, split) + sseRange(split, total);
+    if (sse < bestSSE) {
+      bestSSE = sse;
+      bestSplit = split;
+    }
+  }
+  if (bestSplit === -1) return null;
+
+  // Cluster centers and widths
+  const n1 = bestSplit;
+  const n2 = total - bestSplit;
+  const c1 = (ps[n1] - ps[0]) / n1;
+  const c2 = (ps[total] - ps[n1]) / n2;
+  const var1 = sseRange(0, n1) / n1;
+  const var2 = sseRange(n1, total) / n2;
+  const s1 = Math.sqrt(var1);
+  const s2 = Math.sqrt(var2);
+
+  // Clean-bimodality tests
+  const MIN_SEP = 0.3; // normalized frame width
+  const MAX_CLUSTER_SIGMA = 0.05;
+  if (c2 - c1 < MIN_SEP) return null;
+  if (s1 > MAX_CLUSTER_SIGMA || s2 > MAX_CLUSTER_SIGMA) return null;
+
+  // Find faces near each cluster center across ALL detections (not just
+  // the primary track). This gives us robust Y/size statistics even when
+  // the second speaker wasn't picked as primary for that frame.
+  const TOLERANCE = 0.05;
+  const cluster1Faces: FaceInfo[] = [];
+  const cluster2Faces: FaceInfo[] = [];
+  // Estimate canvas dims to normalize face coords (same approach as Pass 2)
+  let estCanvasW = 0;
+  let estCanvasH = 0;
+  for (const faces of allFacesPerFrame) {
+    for (const f of faces) {
+      const r = f.centerX + f.width / 2;
+      const b = f.centerY + f.height / 2;
+      if (r > estCanvasW) estCanvasW = r;
+      if (b > estCanvasH) estCanvasH = b;
+    }
+  }
+  estCanvasW = Math.max(estCanvasW * 1.05, 1);
+  estCanvasH = Math.max(estCanvasH * 1.05, 1);
+  for (const faces of allFacesPerFrame) {
+    for (const f of faces) {
+      const xNorm = f.centerX / estCanvasW;
+      if (Math.abs(xNorm - c1) < TOLERANCE) cluster1Faces.push(f);
+      else if (Math.abs(xNorm - c2) < TOLERANCE) cluster2Faces.push(f);
+    }
+  }
+  if (cluster1Faces.length < 2 || cluster2Faces.length < 2) return null;
+
+  // Y similarity check
+  const medY1 = median(cluster1Faces.map(f => f.centerY / estCanvasH));
+  const medY2 = median(cluster2Faces.map(f => f.centerY / estCanvasH));
+  if (Math.abs(medY1 - medY2) > 0.25) return null;
+
+  // Size similarity check
+  const medA1 = median(
+    cluster1Faces.map(f => (f.width * f.height) / (estCanvasW * estCanvasH)),
+  );
+  const medA2 = median(
+    cluster2Faces.map(f => (f.width * f.height) / (estCanvasW * estCanvasH)),
+  );
+  if (medA1 <= 0 || medA2 <= 0) return null;
+  const sizeRatio = Math.max(medA1, medA2) / Math.min(medA1, medA2);
+  if (sizeRatio > 2.0) return null;
+
+  // All checks pass — emit dual mode at cluster centers (in source pixels)
+  return {
+    face1X: c1 * videoWidth,
+    face2X: c2 * videoWidth,
   };
 }
 

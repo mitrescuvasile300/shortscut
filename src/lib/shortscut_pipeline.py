@@ -1007,6 +1007,92 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count}}))
         return {"mode": "center", "crop_x": max_crop_x // 2}
 
     # ──────────────────────────────────────────────────────────────────
+    #  Step 3.5: BIMODALITY-BASED DUAL FALLBACK.
+    #
+    #  Step 1 (same-frame dual detection) requires both speakers to be
+    #  visible in the same frame ≥85% of the time. In real interview /
+    #  podcast footage this often misses dual mode because:
+    #    - Strict profile views drop face detector confidence; the
+    #      primary track ping-pongs between speakers instead of detecting
+    #      both at once
+    #    - One speaker frequently looks down at notes / laptop / mug
+    #
+    #  This pass catches that case: if the cleaned primary-X track is
+    #  CLEANLY BIMODAL (two tight clusters separated by ≥0.30 of frame
+    #  width, each cluster getting ≥25% of frames, each σ < 0.05), AND
+    #  the median face at each cluster passes the Y/size constraints
+    #  already used in Step 1, then it's a real dual scene.
+    # ──────────────────────────────────────────────────────────────────
+    sorted_xs = sorted(valid)
+    total = len(sorted_xs)
+    min_side = max(2, math.ceil(total * 0.25))
+    bimodal_result = None
+    if total >= 8:
+        # Find split that minimizes total within-cluster SSE
+        # Use prefix sums for O(1) variance per split
+        ps = [0.0] * (total + 1)
+        pss = [0.0] * (total + 1)
+        for i in range(total):
+            ps[i + 1] = ps[i] + sorted_xs[i]
+            pss[i + 1] = pss[i] + sorted_xs[i] * sorted_xs[i]
+        def sse(lo, hi):
+            nn = hi - lo
+            if nn <= 0:
+                return 0.0
+            s = ps[hi] - ps[lo]
+            sq = pss[hi] - pss[lo]
+            return sq - (s * s) / nn
+        best_split = -1
+        best_sse = float("inf")
+        for split in range(min_side, total - min_side + 1):
+            tot_sse = sse(0, split) + sse(split, total)
+            if tot_sse < best_sse:
+                best_sse = tot_sse
+                best_split = split
+        if best_split > 0:
+            n1 = best_split
+            n2 = total - n1
+            c1 = (ps[n1] - ps[0]) / n1
+            c2 = (ps[total] - ps[n1]) / n2
+            s1 = (sse(0, n1) / n1) ** 0.5
+            s2 = (sse(n1, total) / n2) ** 0.5
+            MIN_SEP = 0.30
+            MAX_SIGMA = 0.05
+            if c2 - c1 >= MIN_SEP and s1 < MAX_SIGMA and s2 < MAX_SIGMA:
+                # Collect ALL faces in original data near each cluster center
+                # for Y/size verification
+                tol = 0.05
+                c1_faces = []
+                c2_faces = []
+                for frame_faces in raw:
+                    if not frame_faces:
+                        continue
+                    for f in frame_faces:
+                        if abs(f["x"] - c1) < tol:
+                            c1_faces.append(f)
+                        elif abs(f["x"] - c2) < tol:
+                            c2_faces.append(f)
+                if len(c1_faces) >= 2 and len(c2_faces) >= 2:
+                    med_y1 = statistics.median([f["y"] for f in c1_faces])
+                    med_y2 = statistics.median([f["y"] for f in c2_faces])
+                    med_a1 = statistics.median([f["w"] * f["h"] for f in c1_faces])
+                    med_a2 = statistics.median([f["w"] * f["h"] for f in c2_faces])
+                    if (
+                        abs(med_y1 - med_y2) <= 0.25
+                        and med_a1 > 0 and med_a2 > 0
+                        and max(med_a1, med_a2) / min(med_a1, med_a2) <= 2.0
+                    ):
+                        bimodal_result = {
+                            "mode": "dual",
+                            "face1_x": c1,
+                            "face2_x": c2,
+                        }
+    if bimodal_result is not None:
+        print(f"    👥 Dual mode (bimodal): left={bimodal_result['face1_x']:.2f}, "
+              f"right={bimodal_result['face2_x']:.2f}")
+        return bimodal_result
+
+    # ──────────────────────────────────────────────────────────────────
     #  Step 4: TRY STATIC SINGLE CROP FIRST.
     #          User spec: "default to static, only move camera when the
     #          face goes more than half off-screen."
