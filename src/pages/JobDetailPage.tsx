@@ -11,6 +11,7 @@ import {
   MessageSquareQuote,
   Mic,
   Play,
+  RefreshCw,
   Server,
   Sparkles,
   Terminal,
@@ -199,7 +200,7 @@ export function JobDetailPage() {
   const markJobCompleted = useMutation(api.shorts.markJobCompleted);
   const refreshVideoUrl = useAction(api.processing.refreshVideoUrl);
   const startProcessing = useAction(api.processing.processJob);
-  const processOnServer = useAction(api.serverProcessing.processJobOnServer);
+
 
   const [processing, setProcessing] = useState(false);
   const [startingBackend, setStartingBackend] = useState(false);
@@ -733,10 +734,10 @@ export function JobDetailPage() {
                     </p>
                   </div>
                 </div>
-                {/* Server processing option */}
+                {/* Refresh URL for lower quality */}
                 <div className="mt-3 pt-3 border-t border-primary/20 flex items-center justify-between">
                   <span className="text-xs text-muted-foreground">
-                    Video prea mare pentru browser?
+                    Video prea mare? Reîmprospătează URL-ul.
                   </span>
                   <Button
                     size="sm"
@@ -747,20 +748,24 @@ export function JobDetailPage() {
                       if (!jobId) return;
                       setServerProcessing(true);
                       try {
-                        await processOnServer({ jobId: jobId as Id<"jobs"> });
-                        toast.success("Procesare server finalizată!");
+                        const newUrl = await refreshVideoUrl({ jobId: jobId as Id<"jobs"> });
+                        if (newUrl) {
+                          toast.success("URL reîmprospătat! Reîncearcă generarea.");
+                        } else {
+                          toast.error("Nu s-a putut obține un URL nou.");
+                        }
                       } catch (_err) {
-                        console.error("Server processing failed:", _err);
-                        toast.error("Eroare procesare server");
+                        console.error("Refresh failed:", _err);
+                        toast.error("Eroare la reîmprospătare URL");
                       } finally {
                         setServerProcessing(false);
                       }
                     }}
                   >
                     {serverProcessing ? (
-                      <><Loader2 className="size-3 mr-1 animate-spin" /> Server...</>
+                      <><Loader2 className="size-3 mr-1 animate-spin" /> Se reîmprospătează...</>
                     ) : (
-                      <><Server className="size-3 mr-1" /> Procesează pe Server</>
+                      <><RefreshCw className="size-3 mr-1" /> Reîmprospătează URL</>
                     )}
                   </Button>
                 </div>

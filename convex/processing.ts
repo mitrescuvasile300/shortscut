@@ -705,11 +705,15 @@ function extractStreamsFromPlayerData(
     const mp4_720 = videoFormats.find(
       f => f.height === 720 && f.mimeType?.includes("avc1"),
     );
+    const mp4_480 = videoFormats.find(
+      f => f.height === 480 && f.mimeType?.includes("avc1"),
+    );
     const any720 = videoFormats.find(f => f.height === 720);
-    const best = videoFormats.find(f => (f.height || 0) <= 1080);
+    const any480 = videoFormats.find(f => f.height === 480);
+    const best = videoFormats.find(f => (f.height || 0) <= 720);
 
     videoDownloadUrl =
-      mp4_720?.url || any720?.url || best?.url || videoFormats[0]?.url || null;
+      mp4_720?.url || mp4_480?.url || any720?.url || any480?.url || best?.url || videoFormats[0]?.url || null;
   }
 
   return { audioUrl, videoUrl: videoDownloadUrl, title, duration };
@@ -823,7 +827,8 @@ async function fetchFromPiped(
         bitrate: number;
       }> = data.audioStreams || [];
 
-      // Find best video: prefer mp4 720p, then mp4 1080p, then any 720p
+      // Find best video: prefer mp4 720p, then 480p, then 360p
+      // Separate video-only (adaptive) from muxed streams
       let videoUrl: string | null = null;
       const mp4Videos = videoStreams.filter(
         s => s.mimeType?.startsWith("video/mp4") && s.videoOnly,
@@ -831,17 +836,28 @@ async function fetchFromPiped(
       const mp4_720 = mp4Videos.find(s => s.quality === "720p");
       const mp4_1080 = mp4Videos.find(s => s.quality === "1080p");
       const mp4_480 = mp4Videos.find(s => s.quality === "480p");
-      // Also check muxed (videoOnly=false)
-      const muxedMp4 = videoStreams.find(
+      const mp4_360 = mp4Videos.find(s => s.quality === "360p");
+      // Muxed streams: prefer those with numeric quality labels over LBRY/unknown
+      const muxedMp4All = videoStreams.filter(
         s => s.mimeType?.startsWith("video/mp4") && !s.videoOnly,
       );
+      const muxedLabeled = muxedMp4All.find(
+        s => /^\d+p$/.test(s.quality || ""),
+      );
+      const muxedAny = muxedMp4All[0];
+      // Priority: adaptive 720→480→360 → muxed labeled → adaptive 1080 → muxed any
       videoUrl =
         mp4_720?.url ||
-        mp4_1080?.url ||
         mp4_480?.url ||
-        muxedMp4?.url ||
+        mp4_360?.url ||
+        muxedLabeled?.url ||
+        mp4_1080?.url ||
+        muxedAny?.url ||
         videoStreams[0]?.url ||
         null;
+      console.log(
+        `[Piped] Selected video: ${mp4_720 ? "720p" : mp4_480 ? "480p" : mp4_360 ? "360p" : muxedLabeled ? `muxed-${muxedLabeled.quality}` : mp4_1080 ? "1080p" : muxedAny ? `muxed-${muxedAny.quality}` : "fallback"}`,
+      );
 
       // Find best audio: prefer mp4 audio (m4a), highest bitrate
       let audioUrl: string | null = null;
@@ -855,8 +871,8 @@ async function fetchFromPiped(
         mp4Audio[0]?.url || webmAudio[0]?.url || audioStreams[0]?.url || null;
 
       // If we have a muxed stream (video+audio), we might not need separate audio
-      if (muxedMp4 && !audioUrl) {
-        audioUrl = muxedMp4.url;
+      if (muxedAny && !audioUrl) {
+        audioUrl = muxedAny.url;
       }
 
       // Subtitles

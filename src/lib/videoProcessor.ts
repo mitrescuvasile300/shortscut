@@ -1213,12 +1213,24 @@ export async function processAllClips(
   // For large files (>50 MB), use per-clip segment download to avoid
   // allocating the full video in browser memory (fixes "Array buffer
   // allocation failed" with 4K / long videos).
+  const MAX_BROWSER_SIZE = 150 * 1024 * 1024; // 150MB hard limit for browser
   let useSegmented = false;
+  // detectedSize used for logging only
   try {
     const [rangeOk, totalSize] = await Promise.all([
       supportsRangeRequests(videoUrl),
       getFileSize(videoUrl),
     ]);
+    // detectedSize = totalSize;
+    if (totalSize > MAX_BROWSER_SIZE) {
+      console.error(
+        `[processAllClips] Video ${(totalSize / 1e6).toFixed(0)}MB exceeds ${MAX_BROWSER_SIZE / 1e6}MB browser limit`,
+      );
+      throw new Error(
+        `Video prea mare pentru browser (${(totalSize / 1e6).toFixed(0)}MB). ` +
+        `Reîmprospătează URL-ul pentru calitate mai mică.`,
+      );
+    }
     if (rangeOk && totalSize > 50 * 1024 * 1024) {
       console.log(
         `[processAllClips] ${(totalSize / 1e6).toFixed(0)} MB > 50 MB threshold → segment download`,
@@ -1230,6 +1242,8 @@ export async function processAllClips(
       );
     }
   } catch (e) {
+    // Re-throw size limit errors
+    if (e instanceof Error && e.message.includes("prea mare")) throw e;
     console.log("[processAllClips] Could not probe file, using full download:", e);
   }
 
