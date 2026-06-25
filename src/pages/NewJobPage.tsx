@@ -1,8 +1,8 @@
-import { useMutation, useQuery } from "convex/react";
+import { useAction, useMutation, useQuery } from "convex/react";
 import { ArrowLeft, Loader2, Sparkles } from "lucide-react";
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
-import { api } from "../../convex/_generated/api";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -14,20 +14,17 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
-import { toast } from "sonner";
+import { api } from "../../convex/_generated/api";
 
 export function NewJobPage() {
   const navigate = useNavigate();
   const createJob = useMutation(api.jobs.create);
+  const startProcessing = useAction(api.processing.processJob);
   const settings = useQuery(api.settings.get);
 
   const [videoUrl, setVideoUrl] = useState("");
-  const [language, setLanguage] = useState(
-    settings?.defaultLanguage || "ro"
-  );
-  const [numShorts, setNumShorts] = useState(
-    settings?.defaultNumShorts || 5
-  );
+  const [language, setLanguage] = useState(settings?.defaultLanguage || "ro");
+  const [numShorts, setNumShorts] = useState(settings?.defaultNumShorts || 5);
   const [durationRange, setDurationRange] = useState<[number, number]>([
     30,
     settings?.defaultShortDuration || 300,
@@ -51,9 +48,17 @@ export function NewJobPage() {
         maxDuration: durationRange[1],
       });
 
-      toast.success("Job creat! Descarcă scriptul de pe pagina jobului.");
+      // Start backend processing (download → transcribe → AI analysis)
+      // This runs on the server; the job page will auto-generate shorts in browser
+      // when the backend reaches "generating" status
+      startProcessing({ jobId }).catch(err => {
+        console.error("[NewJobPage] processJob failed:", err);
+        // Job page will show the error via job.status === "failed"
+      });
+
+      toast.success("Procesarea a început! Se analizează video-ul...");
       navigate(`/job/${jobId}`);
-    } catch (err) {
+    } catch (_err) {
       toast.error("Eroare la crearea job-ului");
       setIsSubmitting(false);
     }
@@ -91,7 +96,7 @@ export function NewJobPage() {
             type="url"
             placeholder="https://www.youtube.com/watch?v=..."
             value={videoUrl}
-            onChange={(e) => setVideoUrl(e.target.value)}
+            onChange={e => setVideoUrl(e.target.value)}
             className="h-12 text-base"
             required
           />
@@ -106,7 +111,7 @@ export function NewJobPage() {
             <div className="mt-3">
               {(() => {
                 const match = videoUrl.match(
-                  /(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/
+                  /(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/,
                 );
                 const videoId = match?.[1];
                 if (!videoId) return null;
@@ -116,7 +121,7 @@ export function NewJobPage() {
                       src={`https://img.youtube.com/vi/${videoId}/mqdefault.jpg`}
                       alt="Video thumbnail"
                       className="w-full h-full object-cover"
-                      onError={(e) => {
+                      onError={e => {
                         (e.target as HTMLImageElement).style.display = "none";
                       }}
                     />
@@ -186,26 +191,30 @@ export function NewJobPage() {
           </div>
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-1.5">
-              <Label className="text-xs text-muted-foreground">Minim (secunde)</Label>
+              <Label className="text-xs text-muted-foreground">
+                Minim (secunde)
+              </Label>
               <Input
                 type="number"
                 min={15}
                 max={120}
                 value={durationRange[0]}
-                onChange={(e) =>
+                onChange={e =>
                   setDurationRange([Number(e.target.value), durationRange[1]])
                 }
                 className="h-10"
               />
             </div>
             <div className="space-y-1.5">
-              <Label className="text-xs text-muted-foreground">Maxim (secunde, 300 = fără limită)</Label>
+              <Label className="text-xs text-muted-foreground">
+                Maxim (secunde, 300 = fără limită)
+              </Label>
               <Input
                 type="number"
                 min={30}
                 max={300}
                 value={durationRange[1]}
-                onChange={(e) =>
+                onChange={e =>
                   setDurationRange([durationRange[0], Number(e.target.value)])
                 }
                 className="h-10"
