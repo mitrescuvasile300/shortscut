@@ -204,17 +204,26 @@ http.route({
       );
     }
 
-    // Security: only proxy YouTube CDN URLs
+    // Security: only proxy YouTube CDN & known Piped proxy URLs
     try {
       const parsed = new URL(targetUrl);
-      const isYouTubeCDN =
-        parsed.hostname.endsWith(".googlevideo.com") ||
-        parsed.hostname.endsWith(".youtube.com") ||
-        parsed.hostname.endsWith(".ytimg.com");
+      const h = parsed.hostname;
+      const isAllowed =
+        h.endsWith(".googlevideo.com") ||
+        h.endsWith(".youtube.com") ||
+        h.endsWith(".ytimg.com") ||
+        // Piped proxy instances (rewrite YouTube CDN)
+        h.endsWith(".piped.private.coffee") ||
+        h === "piped.private.coffee" ||
+        h.endsWith(".kavin.rocks") ||
+        h.endsWith(".r4fo.com") ||
+        h.endsWith(".adminforge.de") ||
+        // User's own Piped proxy
+        h === "76.13.133.153";
 
-      if (!isYouTubeCDN) {
+      if (!isAllowed) {
         return new Response(
-          JSON.stringify({ error: "Only YouTube CDN URLs are allowed" }),
+          JSON.stringify({ error: "Only YouTube CDN / Piped proxy URLs are allowed" }),
           { status: 403, headers: { "Content-Type": "application/json", ...corsHeaders } }
         );
       }

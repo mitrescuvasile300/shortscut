@@ -846,18 +846,29 @@ async function fetchFromPiped(
       );
       const muxedAny = muxedMp4All[0];
       // Priority: adaptive 720→480→360 → muxed labeled → adaptive 1080 → muxed any
-      videoUrl =
-        mp4_720?.url ||
-        mp4_480?.url ||
-        mp4_360?.url ||
-        muxedLabeled?.url ||
-        mp4_1080?.url ||
-        muxedAny?.url ||
-        videoStreams[0]?.url ||
-        null;
-      console.log(
-        `[Piped] Selected video: ${mp4_720 ? "720p" : mp4_480 ? "480p" : mp4_360 ? "360p" : muxedLabeled ? `muxed-${muxedLabeled.quality}` : mp4_1080 ? "1080p" : muxedAny ? `muxed-${muxedAny.quality}` : "fallback"}`,
-      );
+      // Track whether selected video is muxed (has embedded audio)
+      let selectedVideoIsMuxed = false;
+      if (mp4_720?.url) {
+        videoUrl = mp4_720.url;
+      } else if (mp4_480?.url) {
+        videoUrl = mp4_480.url;
+      } else if (mp4_360?.url) {
+        videoUrl = mp4_360.url;
+      } else if (muxedLabeled?.url) {
+        videoUrl = muxedLabeled.url;
+        selectedVideoIsMuxed = true;
+      } else if (mp4_1080?.url) {
+        videoUrl = mp4_1080.url;
+      } else if (muxedAny?.url) {
+        videoUrl = muxedAny.url;
+        selectedVideoIsMuxed = true;
+      } else {
+        videoUrl = videoStreams[0]?.url || null;
+      }
+      const selectedLabel = mp4_720 ? "720p" : mp4_480 ? "480p" : mp4_360 ? "360p"
+        : muxedLabeled ? `muxed-${muxedLabeled.quality}` : mp4_1080 ? "1080p"
+        : muxedAny ? `muxed-${muxedAny.quality}` : "fallback";
+      console.log(`[Piped] Selected video: ${selectedLabel} (muxed=${selectedVideoIsMuxed})`);
 
       // Find best audio: prefer mp4 audio (m4a), highest bitrate
       let audioUrl: string | null = null;
@@ -870,8 +881,11 @@ async function fetchFromPiped(
       audioUrl =
         mp4Audio[0]?.url || webmAudio[0]?.url || audioStreams[0]?.url || null;
 
-      // If we have a muxed stream (video+audio), we might not need separate audio
-      if (muxedAny && !audioUrl) {
+      // If selected video is muxed, audio is already embedded — no separate audio needed.
+      // Only use muxed stream as fallback audio when selected video is video-only (adaptive).
+      if (selectedVideoIsMuxed) {
+        audioUrl = null;
+      } else if (muxedAny && !audioUrl) {
         audioUrl = muxedAny.url;
       }
 

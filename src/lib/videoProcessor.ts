@@ -66,91 +66,44 @@ async function getFFmpeg(_onProgress?: ProgressCallback): Promise<FFmpeg> {
 }
 
 // ── Chunked download (unchanged from v1) ───────────────────────────────
-const CHUNK_SIZE = 8 * 1024 * 1024;
+
 
 async function downloadVideo(
   url: string,
   onProgress?: (percent: number) => void,
 ): Promise<Uint8Array> {
-  const probeResp = await fetch(url, { headers: { Range: "bytes=0-0" } });
-  let totalSize = 0;
-  if (probeResp.status === 206) {
-    const cr = probeResp.headers.get("Content-Range");
-    if (cr) {
-      const match = cr.match(/\/(\d+)/);
-      if (match) totalSize = parseInt(match[1], 10);
-    }
-  }
-  if (!totalSize) {
-    const fullResp = await fetch(url);
-    if (!fullResp.ok) throw new Error(`Download failed: ${fullResp.status}`);
-    totalSize = Number(fullResp.headers.get("content-length") || 0);
-    if (totalSize > 0 && totalSize <= CHUNK_SIZE) {
-      const reader = fullResp.body?.getReader();
-      if (!reader) throw new Error("No response body");
-      const chunks: Uint8Array[] = [];
-      let received = 0;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        received += value.length;
-        if (onProgress) onProgress(Math.round((received / totalSize) * 100));
-      }
-      const result = new Uint8Array(received);
-      let offset = 0;
-      for (const chunk of chunks) {
-        result.set(chunk, offset);
-        offset += chunk.length;
-      }
-      return result;
-    }
-    if (!totalSize) {
-      const reader = fullResp.body?.getReader();
-      if (!reader) throw new Error("No response body");
-      const chunks: Uint8Array[] = [];
-      let received = 0;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        received += value.length;
-      }
-      const result = new Uint8Array(received);
-      let offset = 0;
-      for (const chunk of chunks) {
-        result.set(chunk, offset);
-        offset += chunk.length;
-      }
-      return result;
-    }
-  }
+  // Simple streaming download — accumulate chunks, concat at end.
+  // Avoids redundant fetches & large pre-allocations.
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
+  const totalSize = Number(resp.headers.get("content-length") || 0);
   console.log(
-    `[download] Total size: ${(totalSize / 1024 / 1024).toFixed(1)}MB, chunk size: ${(CHUNK_SIZE / 1024 / 1024).toFixed(0)}MB`,
+    `[download] Starting: ${totalSize ? `${(totalSize / 1024 / 1024).toFixed(1)}MB` : "unknown size"}`,
   );
-  const result = new Uint8Array(totalSize);
-  let downloaded = 0;
-  while (downloaded < totalSize) {
-    const start = downloaded;
-    const end = Math.min(downloaded + CHUNK_SIZE - 1, totalSize - 1);
-    const chunkResp = await fetch(url, {
-      headers: { Range: `bytes=${start}-${end}` },
-    });
-    if (!chunkResp.ok && chunkResp.status !== 206) {
-      throw new Error(
-        `Chunk download failed: ${chunkResp.status} (bytes ${start}-${end})`,
-      );
-    }
-    const reader = chunkResp.body?.getReader();
-    if (!reader) throw new Error("No chunk body");
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      result.set(value, downloaded);
-      downloaded += value.length;
-      if (onProgress) onProgress(Math.round((downloaded / totalSize) * 100));
+
+  const reader = resp.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (onProgress && totalSize > 0) {
+      onProgress(Math.round((received / totalSize) * 100));
     }
   }
+
+  // Concat all chunks into a single Uint8Array
+  const result = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.length;
+  }
+  console.log(`[download] Complete: ${(received / 1024 / 1024).toFixed(1)}MB`);
   return result;
 }
 
