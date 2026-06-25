@@ -39,6 +39,11 @@ NUM_SHORTS = 5
 CANDIDATES_PER_CHUNK = 6
 CHUNK_CHARS = 12_000  # ~20 min of transcript per chunk
 
+# ── Silence removal constants ────────────────────────────────────
+SILENCE_THRESHOLD_DB = -30   # dB below which audio is considered silent
+MIN_SILENCE_DURATION = 0.8   # seconds — silences shorter than this are kept
+SILENCE_PADDING = 0.12       # seconds kept at each cut boundary for natural transitions
+
 
 # ─────────────────────────── venv bootstrap ──────────────────────
 def ensure_venv():
@@ -388,6 +393,29 @@ Find up to {n} potential viral short clips (MINIMUM {MIN_DURATION}s, NO UPPER LI
 ## ⚡ Audio Peaks — rapid back-and-forth (alternating short segments), passionate disagreements
 ## 😂 Laughter & Comedy — [laughter], comedic timing, self-deprecation
 
+# CLIP BOUNDARY RULES (CRITICAL — read carefully)
+## START boundary:
+- Begin at the EXACT sentence that hooks the viewer.
+- Do NOT include generic setup or small talk before the hook.
+## END boundary:
+- The clip MUST end AFTER the payoff has FULLY landed.
+- If there is LAUGHTER or audience/host reaction after a punchline or key moment, ALWAYS INCLUDE IT. The laughter validates the joke for the viewer — cutting before the laugh ruins the clip.
+- If the speaker makes a concluding remark ("so yeah", "that's the thing", "exactly"), include it.
+- If someone reacts with "wow", "no way", "that's crazy", "haha" etc. after a key point, INCLUDE that reaction.
+- NEVER cut while the speaker is mid-sentence or mid-thought. Wait for the thought to complete.
+- NEVER cut while laughter is still happening — let it die down naturally, THEN cut.
+- If the SUBJECT CHANGES to something unrelated, END the clip just BEFORE the topic switch. Look for transition signals: "anyway", "so moving on", "but let me tell you about", a new question starting, or a long pause followed by a completely different topic.
+## NATURAL END signals (cut AFTER these):
+- A clear pause after the payoff (speaker takes a breath)
+- Host acknowledgment: "right", "absolutely", "interesting" (include this, then cut)
+- Laughter dying down
+- A one-word reaction that punctuates the moment
+## NEVER end at these:
+- Mid-word or mid-sentence
+- Right on a punchline without the reaction
+- While someone is still laughing
+- On "and then..." or "so..." (unfinished thought)
+
 # WHAT TO SKIP
 - Needs backstory ("as I was saying earlier..."), generic advice, slow build-ups
 - Mid-sentence cuts, unresolved thoughts, pure agreement/small talk
@@ -401,7 +429,7 @@ Find up to {n} potential viral short clips (MINIMUM {MIN_DURATION}s, NO UPPER LI
 # TIMESTAMP RULES
 Use [MM:SS] or [HH:MM:SS] timestamps from the transcript → convert to total seconds.
 hookLine = exact sentence copied VERBATIM from the transcript.
-endSeconds = where the clip NATURALLY ends (after the payoff/reaction lands).
+endSeconds = where the clip NATURALLY ends (after the payoff/reaction lands). INCLUDE any laughter or reaction AFTER the main point.
 
 # LANGUAGE: titles, reasoning in {language}. hookLine verbatim from transcript.
 
@@ -1303,6 +1331,145 @@ def build_tracking_crop_expr(keyframes: list, max_crop_x: int) -> str:
 
 
 
+# ─────────────────────────── silence removal ─────────────────────
+def detect_silence(video_path: Path, start_time: float, duration: float,
+                   threshold_db: int = SILENCE_THRESHOLD_DB,
+                   min_dur: float = MIN_SILENCE_DURATION) -> list[tuple[float, float]]:
+    """Detect silent intervals using ffmpeg silencedetect. Returns clip-relative times."""
+    cmd = [
+        "ffmpeg", "-ss", str(start_time), "-i", str(video_path),
+        "-t", str(duration),
+        "-af", f"silencedetect=noise={threshold_db}dB:d={min_dur}",
+        "-vn", "-f", "null", "-",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+
+    silences: list[tuple[float, float]] = []
+    cur_start = None
+    for line in result.stderr.split("\n"):
+        m = re.search(r"silence_start:\s*([\d.]+)", line)
+        if m:
+            cur_start = float(m.group(1))
+            continue
+        m = re.search(r"silence_end:\s*([\d.]+)", line)
+        if m and cur_start is not None:
+            silences.append((cur_start, float(m.group(1))))
+            cur_start = None
+    if cur_start is not None:
+        silences.append((cur_start, duration))
+    return silences
+
+
+def build_speaking_segments(silences: list[tuple[float, float]], clip_duration: float,
+                            padding: float = SILENCE_PADDING
+                            ) -> list[tuple[float, float, float]]:
+    """Convert silence intervals into (srcStart, srcEnd, outStart) speaking segments."""
+    if not silences:
+        return [(0.0, clip_duration, 0.0)]
+
+    # Merge silences closer than 0.25 s
+    merged: list[tuple[float, float]] = []
+    for s_start, s_end in silences:
+        if merged and s_start - merged[-1][1] < 0.25:
+            merged[-1] = (merged[-1][0], s_end)
+        else:
+            merged.append((s_start, s_end))
+
+    segments: list[tuple[float, float, float]] = []
+    out_t = 0.0
+    last_end = 0.0
+
+    for s_start, s_end in merged:
+        seg_end = min(s_start + padding, clip_duration)
+        if seg_end - last_end > 0.05:
+            segments.append((last_end, seg_end, out_t))
+            out_t += seg_end - last_end
+        last_end = max(s_end - padding, last_end)
+
+    if clip_duration - last_end > 0.05:
+        segments.append((last_end, clip_duration, out_t))
+
+    return segments
+
+
+def remap_time(t: float, segs: list[tuple[float, float, float]]) -> float | None:
+    """Map source clip-relative time to output time after silence removal."""
+    for src_s, src_e, out_s in segs:
+        if src_s <= t <= src_e:
+            return out_s + (t - src_s)
+    return None
+
+
+def adjust_ass_for_silence_removal(ass_content: str,
+                                   segs: list[tuple[float, float, float]]) -> str:
+    """Rewrite ASS subtitle timings to match the silence-removed timeline."""
+    def parse_t(s: str) -> float:
+        m = re.match(r"(\d+):(\d{2}):(\d{2})\.(\d{2})", s.strip())
+        return int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3]) + int(m[4]) / 100 if m else 0.0
+
+    def fmt_t(t: float) -> str:
+        h = int(t // 3600)
+        m = int((t % 3600) // 60)
+        s = int(t % 60)
+        cs = round((t % 1) * 100)
+        return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+    result: list[str] = []
+    for line in ass_content.split("\n"):
+        if not line.startswith("Dialogue:"):
+            result.append(line)
+            continue
+        parts = line.split(",")
+        if len(parts) < 3:
+            result.append(line)
+            continue
+        st, et = parse_t(parts[1]), parse_t(parts[2])
+        mid = (st + et) / 2
+        nm = remap_time(mid, segs)
+        if nm is None:
+            continue  # subtitle falls entirely in silence — drop it
+        ns = remap_time(st, segs)
+        ne = remap_time(et, segs)
+        if ns is None:
+            ns = max(0, nm - (et - st) / 2)
+        if ne is None:
+            ne = ns + (et - st)
+        parts[1] = fmt_t(ns)
+        parts[2] = fmt_t(ne)
+        result.append(",".join(parts))
+    return "\n".join(result)
+
+
+def get_crop_x_at_time(face_info: dict, t: float, src_w: int, crop_w: int) -> int:
+    """Look up the crop X from a face_info at a given clip-relative time."""
+    max_x = src_w - crop_w
+    mode = face_info.get("mode", "center")
+    if mode in ("single", "center"):
+        return face_info.get("crop_x", max_x // 2)
+    if mode == "tracking":
+        kfs = face_info.get("keyframes", [])
+        if not kfs:
+            return max_x // 2
+        if t <= kfs[0][0]:
+            return int(kfs[0][1])
+        if t >= kfs[-1][0]:
+            return int(kfs[-1][1])
+        for j in range(len(kfs) - 1):
+            t0, x0 = kfs[j]
+            t1, x1 = kfs[j + 1]
+            if t0 <= t <= t1:
+                f = (t - t0) / (t1 - t0) if t1 > t0 else 0
+                return int(x0 + f * (x1 - x0))
+        return int(kfs[0][1])
+    if mode == "dual":
+        f1 = face_info.get("face1_x", 0.5)
+        f2 = face_info.get("face2_x", 0.5)
+        mid = (f1 + f2) / 2
+        cx = int(mid * src_w - crop_w / 2)
+        return max(0, min(cx, max_x))
+    return max_x // 2
+
+
 # ─────────────────────────── step 5: generate shorts ─────────────
 def generate_ass_subtitles(words: list[dict], start_time: float,
                            end_time: float, out_w: int, out_h: int) -> str:
@@ -1413,6 +1580,22 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
             else:
                 print(f" ❌ no face → center crop")
 
+    # ── Silence detection per clip ──────────────────────────────────
+    print(f"\n🔇 Detecting silence / dead time in clips...")
+    silence_results: list[list[tuple[float, float]]] = []
+    for i, clip in enumerate(clips):
+        dur = clip["endTime"] - clip["startTime"]
+        silences = detect_silence(video_path, clip["startTime"], dur)
+        total_s = sum(e - s for s, e in silences)
+        if silences and total_s > 0.8:
+            segs = build_speaking_segments(silences, dur)
+            out_dur = sum(e - s for s, e, _ in segs)
+            print(f"  Clip {i+1}: {len(silences)} silences ({total_s:.1f}s) → "
+                  f"{dur:.0f}s → {out_dur:.1f}s (-{(1 - out_dur / dur) * 100:.0f}%)")
+        else:
+            print(f"  Clip {i+1}: no significant silence")
+        silence_results.append(silences)
+
     # Generate shorts
     print(f"\n✂️  Step 5/5: Cutting {len(clips)} shorts...")
     output_files = []
@@ -1437,6 +1620,20 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
         ass_content = generate_ass_subtitles(
             transcript["words"], start, start + dur, out_w, out_h,
         )
+
+        # ── Silence removal for this clip ────────────────────────
+        clip_silences = silence_results[i]
+        total_silence = sum(e - s for s, e in clip_silences)
+        speaking_segs = None
+        if clip_silences and total_silence > 0.8:
+            segs = build_speaking_segments(clip_silences, dur)
+            if len(segs) > 1:
+                speaking_segs = segs
+                # Adjust subtitle timings for the new timeline
+                ass_content = adjust_ass_for_silence_removal(ass_content, segs)
+                out_dur = sum(e - s for s, e, _ in segs)
+                print(f"     🔇 Removing {total_silence:.1f}s silence → {out_dur:.1f}s output")
+
         ass_path = output_dir / f"sub_{i+1:02d}.ass"
         with open(ass_path, "w", encoding="utf-8") as f:
             f.write(ass_content)
@@ -1478,6 +1675,88 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
         # ── Build ffmpeg command with subtitle burning ──
         # Try ass= filter first, then subtitles= filter, then no subs
         success = False
+
+        # ── SILENCE REMOVAL PATH ─────────────────────────────────
+        # When speaking_segs is set, build a combined filter_complex
+        # that trims out silence + applies crop + concats segments.
+        if speaking_segs and not success:
+            n_segs = len(speaking_segs)
+            for sub_filter_name in ["ass", "subtitles", None]:
+                if success:
+                    break
+                fc_parts: list[str] = []
+                vs = "".join(f"[v{j}]" for j in range(n_segs))
+                asa = "".join(f"[a{j}]" for j in range(n_segs))
+                fc_parts.append(f"[0:v]split={n_segs}{vs}")
+                fc_parts.append(f"[0:a]asplit={n_segs}{asa}")
+
+                for j, (seg_s, seg_e, _seg_out) in enumerate(speaking_segs):
+                    mid_t = (seg_s + seg_e) / 2
+                    if is_dual:
+                        dual_crop_w2 = min(src_w, int(src_h * 9 / 8))
+                        half_h2 = out_h // 2
+                        cx1b = max(0, min(int(face_info["face1_x"] * src_w - dual_crop_w2 / 2), src_w - dual_crop_w2))
+                        cx2b = max(0, min(int(face_info["face2_x"] * src_w - dual_crop_w2 / 2), src_w - dual_crop_w2))
+                        fc_parts.append(
+                            f"[v{j}]trim=start={seg_s:.3f}:end={seg_e:.3f},setpts=PTS-STARTPTS,"
+                            f"split=2[v{j}t][v{j}b]"
+                        )
+                        fc_parts.append(f"[v{j}t]crop={dual_crop_w2}:{crop_h}:{cx1b}:0,scale={out_w}:{half_h2}[v{j}tc]")
+                        fc_parts.append(f"[v{j}b]crop={dual_crop_w2}:{crop_h}:{cx2b}:0,scale={out_w}:{half_h2}[v{j}bc]")
+                        fc_parts.append(f"[v{j}tc][v{j}bc]vstack=inputs=2[vo{j}]")
+                    else:
+                        cx = get_crop_x_at_time(face_info, mid_t, src_w, crop_w)
+                        fc_parts.append(
+                            f"[v{j}]trim=start={seg_s:.3f}:end={seg_e:.3f},setpts=PTS-STARTPTS,"
+                            f"crop={crop_w}:{crop_h}:{cx}:0,scale={out_w}:{out_h}[vo{j}]"
+                        )
+                    fc_parts.append(
+                        f"[a{j}]atrim=start={seg_s:.3f}:end={seg_e:.3f},asetpts=PTS-STARTPTS[ao{j}]"
+                    )
+
+                concat_in = "".join(f"[vo{j}][ao{j}]" for j in range(n_segs))
+                fc_parts.append(f"{concat_in}concat=n={n_segs}:v=1:a=1[cv][ca]")
+
+                if sub_filter_name:
+                    fc_parts.append(f"[cv]{sub_filter_name}={ass_esc}[fv]")
+                    v_label, a_label = "[fv]", "[ca]"
+                else:
+                    v_label, a_label = "[cv]", "[ca]"
+
+                vf = ";".join(fc_parts)
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-ss", str(start), "-i", str(video_path), "-t", str(dur),
+                    "-filter_complex", vf,
+                    "-map", v_label, "-map", a_label,
+                    "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart",
+                    str(output_file),
+                ]
+                label = f"[{sub_filter_name}+silence_rm]" if sub_filter_name else "[silence_rm, no subs]"
+                try:
+                    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                    if proc.returncode != 0:
+                        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=proc.stderr)
+                    size_mb = output_file.stat().st_size / (1024 * 1024)
+                    print(f"     ✅ {output_file.name} ({size_mb:.1f} MB) {label}")
+                    output_files.append(output_file)
+                    success = True
+                except subprocess.CalledProcessError as e:
+                    stderr_msg = getattr(e, 'stderr', '') or ''
+                    if stderr_msg:
+                        err_lines = [l for l in stderr_msg.strip().split('\n') if l.strip()][-2:]
+                        for el in err_lines:
+                            print(f"     ⚠️  {el.strip()}")
+                    if sub_filter_name == "ass":
+                        print(f"     ⚠️  ass+silence_rm failed, trying subtitles filter...")
+                    elif sub_filter_name == "subtitles":
+                        print(f"     ⚠️  subtitles+silence_rm failed, trying without subs...")
+                    else:
+                        print(f"     ⚠️  silence_rm failed entirely, falling back to normal pipeline...")
+                        speaking_segs = None  # fall through to normal path
+
         for sub_filter_name in ["ass", "subtitles", None]:
             if success:
                 break

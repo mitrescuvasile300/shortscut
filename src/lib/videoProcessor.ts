@@ -383,6 +383,262 @@ function clampCrop(x: number, srcW: number, cropW: number): number {
   return Math.max(0, Math.min(x, srcW - cropW));
 }
 
+// ── Silence removal ────────────────────────────────────────────────────
+// Detects dead-time (silent pauses ≥ 0.8 s) and removes them so the
+// output feels snappier.  Short padding (~120 ms) is kept at cut
+// boundaries for natural-sounding transitions.
+
+interface SilenceInterval {
+  start: number; // clip-relative seconds
+  end: number;
+}
+
+interface SpeakingSegment {
+  srcStart: number; // clip-relative
+  srcEnd: number;
+  outStart: number; // output-timeline start
+}
+
+/**
+ * Run ffmpeg `silencedetect` on a clip and return silence intervals.
+ * Times are clip-relative (0 = clip start).
+ */
+async function detectSilenceInClip(
+  ffmpeg: FFmpeg,
+  clipStart: number,
+  clipDuration: number,
+  thresholdDb = -30,
+  minDuration = 0.8,
+): Promise<SilenceInterval[]> {
+  const logLines: string[] = [];
+  const handler = ({ message }: { message: string }) => {
+    logLines.push(message);
+  };
+  ffmpeg.on("log", handler);
+
+  const fastSeek = Math.max(0, clipStart - 0.5);
+  const innerSeek = clipStart - fastSeek;
+
+  try {
+    await ffmpeg.exec([
+      "-ss",
+      formatTime(fastSeek),
+      "-i",
+      "source.mp4",
+      "-ss",
+      formatTime(innerSeek),
+      "-t",
+      clipDuration.toFixed(3),
+      "-af",
+      `silencedetect=noise=${thresholdDb}dB:d=${minDuration}`,
+      "-vn",
+      "-f",
+      "null",
+      "-",
+    ]);
+  } catch {
+    return [];
+  }
+
+  const silences: SilenceInterval[] = [];
+  let curStart: number | null = null;
+  for (const line of logLines) {
+    const sm = line.match(/silence_start:\s*([\d.]+)/);
+    if (sm) {
+      curStart = Number.parseFloat(sm[1]);
+      continue;
+    }
+    const em = line.match(/silence_end:\s*([\d.]+)/);
+    if (em && curStart !== null) {
+      silences.push({
+        start: curStart,
+        end: Number.parseFloat(em[1]),
+      });
+      curStart = null;
+    }
+  }
+  if (curStart !== null) {
+    silences.push({ start: curStart, end: clipDuration });
+  }
+  return silences;
+}
+
+/**
+ * Convert silence intervals into speaking segments with output offsets.
+ * Keeps `padding` seconds at each cut boundary for natural transitions.
+ */
+function buildSpeakingSegments(
+  silences: SilenceInterval[],
+  clipDuration: number,
+  padding = 0.12,
+): SpeakingSegment[] {
+  if (!silences.length)
+    return [{ srcStart: 0, srcEnd: clipDuration, outStart: 0 }];
+
+  // Merge silences closer than 0.25 s
+  const merged: SilenceInterval[] = [];
+  for (const s of silences) {
+    if (merged.length && s.start - merged[merged.length - 1].end < 0.25) {
+      merged[merged.length - 1].end = s.end;
+    } else {
+      merged.push({ start: s.start, end: s.end });
+    }
+  }
+
+  const segments: SpeakingSegment[] = [];
+  let out = 0;
+  let lastEnd = 0;
+
+  for (const silence of merged) {
+    const segEnd = Math.min(silence.start + padding, clipDuration);
+    if (segEnd - lastEnd > 0.05) {
+      segments.push({ srcStart: lastEnd, srcEnd: segEnd, outStart: out });
+      out += segEnd - lastEnd;
+    }
+    lastEnd = Math.max(silence.end - padding, lastEnd);
+  }
+  if (clipDuration - lastEnd > 0.05) {
+    segments.push({ srcStart: lastEnd, srcEnd: clipDuration, outStart: out });
+  }
+  return segments;
+}
+
+/** Map a source time to its position in the silence-removed output. */
+function remapTimeToOutput(t: number, segs: SpeakingSegment[]): number | null {
+  for (const s of segs) {
+    if (t >= s.srcStart && t <= s.srcEnd) return s.outStart + (t - s.srcStart);
+  }
+  return null;
+}
+
+/** Rewrite ASS subtitle timings to match the silence-removed timeline. */
+function adjustAssForSilenceRemoval(
+  ass: string,
+  segs: SpeakingSegment[],
+): string {
+  const parseT = (s: string) => {
+    const m = s.match(/(\d+):(\d{2}):(\d{2})\.(\d{2})/);
+    return m ? +m[1] * 3600 + +m[2] * 60 + +m[3] + +m[4] / 100 : 0;
+  };
+  const fmtT = (t: number) => {
+    const h = Math.floor(t / 3600);
+    const m = Math.floor((t % 3600) / 60);
+    const s = Math.floor(t % 60);
+    const cs = Math.round((t % 1) * 100);
+    return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(cs).padStart(2, "0")}`;
+  };
+
+  return ass
+    .split("\n")
+    .map(line => {
+      if (!line.startsWith("Dialogue:")) return line;
+      const parts = line.split(",");
+      if (parts.length < 3) return line;
+      const st = parseT(parts[1]);
+      const et = parseT(parts[2]);
+      const mid = (st + et) / 2;
+      const nm = remapTimeToOutput(mid, segs);
+      if (nm === null) return null; // subtitle falls in silence → drop
+      const ns = remapTimeToOutput(st, segs) ?? Math.max(0, nm - (et - st) / 2);
+      const ne = remapTimeToOutput(et, segs) ?? ns + (et - st);
+      parts[1] = fmtT(ns);
+      parts[2] = fmtT(ne);
+      return parts.join(",");
+    })
+    .filter(l => l !== null)
+    .join("\n");
+}
+
+/** Look up the crop X from a CropPlan at a given clip-relative time. */
+function getCropXAtTime(plan: CropPlan, t: number): number {
+  const cropW = Math.round((plan.videoHeight * 9) / 16);
+  const maxX = plan.videoWidth - cropW;
+  for (const seg of plan.segments) {
+    if (t < seg.startTime || t > seg.endTime) continue;
+    if (seg.mode === "center" || seg.mode === "single")
+      return seg.cropX ?? Math.round(maxX / 2);
+    if (seg.mode === "dual") {
+      const mid = ((seg.face1X ?? 0) + (seg.face2X ?? 0)) / 2;
+      return clampCrop(Math.round(mid - cropW / 2), plan.videoWidth, cropW);
+    }
+    if (seg.mode === "tracking" && seg.keyframes?.length) {
+      const kfs = seg.keyframes;
+      const rt = t - seg.startTime;
+      if (rt <= kfs[0].t) return Math.round(kfs[0].x);
+      if (rt >= kfs[kfs.length - 1].t) return Math.round(kfs[kfs.length - 1].x);
+      for (let i = 0; i < kfs.length - 1; i++) {
+        if (rt >= kfs[i].t && rt <= kfs[i + 1].t) {
+          const f = (rt - kfs[i].t) / (kfs[i + 1].t - kfs[i].t);
+          return Math.round(kfs[i].x + f * (kfs[i + 1].x - kfs[i].x));
+        }
+      }
+    }
+  }
+  return Math.round(maxX / 2);
+}
+
+/**
+ * Build a filter_complex that removes silence AND applies crop + scale
+ * in a single pass.  Each speaking segment gets its own trim/crop branch,
+ * then all branches are concatenated.
+ */
+function buildSilenceRemovalFilters(
+  segs: SpeakingSegment[],
+  plan: CropPlan,
+  outW: number,
+  outH: number,
+  hasSubs: boolean,
+): { filterComplex: string; outVLabel: string; outALabel: string } {
+  const { videoWidth: srcW, videoHeight: srcH } = plan;
+  const cropW = Math.round((srcH * 9) / 16);
+  const cropH = srcH;
+  const n = segs.length;
+
+  const dualSeg = plan.segments.find(s => s.mode === "dual");
+
+  let fc = "";
+  const vs = Array.from({ length: n }, (_, i) => `[v${i}]`).join("");
+  const as = Array.from({ length: n }, (_, i) => `[a${i}]`).join("");
+  fc += `[0:v]split=${n}${vs};[0:a]asplit=${n}${as}`;
+
+  for (let i = 0; i < n; i++) {
+    const s = segs[i];
+    const midT = (s.srcStart + s.srcEnd) / 2;
+
+    if (dualSeg) {
+      const halfH = Math.floor(outH / 2);
+      const dualCropW = Math.min(srcW, Math.round((srcH * 9) / 8));
+      const cx1 = clampCrop(
+        Math.round((dualSeg.face1X ?? 0) - dualCropW / 2),
+        srcW,
+        dualCropW,
+      );
+      const cx2 = clampCrop(
+        Math.round((dualSeg.face2X ?? 0) - dualCropW / 2),
+        srcW,
+        dualCropW,
+      );
+      fc += `;[v${i}]trim=start=${s.srcStart.toFixed(3)}:end=${s.srcEnd.toFixed(3)},setpts=PTS-STARTPTS,split=2[v${i}t][v${i}b]`;
+      fc += `;[v${i}t]crop=${dualCropW}:${cropH}:${cx1}:0,scale=${outW}:${halfH}[v${i}tc]`;
+      fc += `;[v${i}b]crop=${dualCropW}:${cropH}:${cx2}:0,scale=${outW}:${halfH}[v${i}bc]`;
+      fc += `;[v${i}tc][v${i}bc]vstack=inputs=2[vo${i}]`;
+    } else {
+      const cx = getCropXAtTime(plan, midT);
+      fc += `;[v${i}]trim=start=${s.srcStart.toFixed(3)}:end=${s.srcEnd.toFixed(3)},setpts=PTS-STARTPTS,crop=${cropW}:${cropH}:${cx}:0,scale=${outW}:${outH}[vo${i}]`;
+    }
+    fc += `;[a${i}]atrim=start=${s.srcStart.toFixed(3)}:end=${s.srcEnd.toFixed(3)},asetpts=PTS-STARTPTS[ao${i}]`;
+  }
+
+  const ci = Array.from({ length: n }, (_, i) => `[vo${i}][ao${i}]`).join("");
+  fc += `;${ci}concat=n=${n}:v=1:a=1[cv][ca]`;
+
+  if (hasSubs) {
+    fc += `;[cv]ass=subs.ass[fv]`;
+    return { filterComplex: fc, outVLabel: "[fv]", outALabel: "[ca]" };
+  }
+  return { filterComplex: fc, outVLabel: "[cv]", outALabel: "[ca]" };
+}
+
 // ── Frame-accurate sampling via ffmpeg.wasm ───────────────────────────
 /**
  * Extract `fps` frames per second of clip duration as decoded image
@@ -539,11 +795,7 @@ async function processClip(
   const outW = 1080;
   const outH = 1920;
   const hasSubs = !!clip.assSubtitles;
-
-  if (hasSubs && clip.assSubtitles) {
-    const encoder = new TextEncoder();
-    await ffmpeg.writeFile("subs.ass", encoder.encode(clip.assSubtitles));
-  }
+  let assContent = clip.assSubtitles || "";
 
   // Build a CropPlan from whatever we have
   let plan: CropPlan;
@@ -569,12 +821,42 @@ async function processClip(
     };
   }
 
-  const { vf, filterComplex, outLabel } = buildFilters(
-    plan,
-    outW,
-    outH,
-    hasSubs,
-  );
+  // ── Silence detection & removal ──────────────────────────────────
+  // Detect dead-time pauses ≥ 0.8 s and remove them for a snappier result.
+  let speakingSegs: SpeakingSegment[] | null = null;
+  try {
+    const silences = await detectSilenceInClip(
+      ffmpeg,
+      clip.startTime,
+      duration,
+    );
+    const totalSilence = silences.reduce((s, si) => s + (si.end - si.start), 0);
+    if (totalSilence > 0.8 && silences.length > 0) {
+      const segs = buildSpeakingSegments(silences, duration);
+      if (segs.length > 1) {
+        speakingSegs = segs;
+        const outDur = segs.reduce(
+          (s, seg) => s + (seg.srcEnd - seg.srcStart),
+          0,
+        );
+        console.log(
+          `[silenceRemoval] Clip ${clip.index}: removed ${totalSilence.toFixed(1)}s silence ` +
+            `(${duration.toFixed(1)}s → ${outDur.toFixed(1)}s, ${segs.length} segments)`,
+        );
+        // Adjust subtitle timings to the new timeline
+        if (hasSubs && assContent) {
+          assContent = adjustAssForSilenceRemoval(assContent, segs);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn(`[silenceRemoval] Clip ${clip.index} detection failed:`, e);
+  }
+
+  if (hasSubs && assContent) {
+    const encoder = new TextEncoder();
+    await ffmpeg.writeFile("subs.ass", encoder.encode(assContent));
+  }
 
   // -ss BEFORE -i is fast-seek (keyframe-aligned, can be off by 1-2s).
   // For frame-accurate start we want -ss AFTER -i, at the cost of decoding
@@ -594,26 +876,52 @@ async function processClip(
     String(duration.toFixed(3)),
   ];
 
-  if (filterComplex && outLabel) {
+  if (speakingSegs) {
+    // Combined silence-removal + crop + scale filter chain
+    const { filterComplex, outVLabel, outALabel } = buildSilenceRemovalFilters(
+      speakingSegs,
+      plan,
+      outW,
+      outH,
+      hasSubs,
+    );
     args.push(
       "-filter_complex",
       filterComplex,
       "-map",
-      outLabel,
+      outVLabel,
       "-map",
-      "0:a?",
+      outALabel,
     );
-  } else if (vf) {
-    args.push("-vf", vf);
+  } else {
+    // Original filter chain (no silence to remove)
+    const { vf, filterComplex, outLabel } = buildFilters(
+      plan,
+      outW,
+      outH,
+      hasSubs,
+    );
+    if (filterComplex && outLabel) {
+      args.push(
+        "-filter_complex",
+        filterComplex,
+        "-map",
+        outLabel,
+        "-map",
+        "0:a?",
+      );
+    } else if (vf) {
+      args.push("-vf", vf);
+    }
   }
 
   args.push(
     "-c:v",
     "libx264",
     "-preset",
-    "veryfast", // was "ultrafast"
+    "veryfast",
     "-crf",
-    "23", // was "28"
+    "23",
     "-c:a",
     "aac",
     "-b:a",
