@@ -11,6 +11,7 @@ import {
   MessageSquareQuote,
   Mic,
   Play,
+  Server,
   Sparkles,
   Terminal,
   Video,
@@ -198,9 +199,11 @@ export function JobDetailPage() {
   const markJobCompleted = useMutation(api.shorts.markJobCompleted);
   const refreshVideoUrl = useAction(api.processing.refreshVideoUrl);
   const startProcessing = useAction(api.processing.processJob);
+  const processOnServer = useAction(api.serverProcessing.processJobOnServer);
 
   const [processing, setProcessing] = useState(false);
   const [startingBackend, setStartingBackend] = useState(false);
+  const [serverProcessing, setServerProcessing] = useState(false);
   const [progress, setProgress] = useState<ProcessingProgress | null>(null);
   const [generatedBlobs, setGeneratedBlobs] = useState<
     Map<number, { blob: Blob; url: string }>
@@ -538,7 +541,53 @@ export function JobDetailPage() {
             </div>
           </div>
 
-          {/* Secondary: Download Script */}
+          {/* Secondary: Process on Server */}
+          <div className="border rounded-xl p-4 hover:bg-accent/10 transition-colors">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <Server className="size-5 text-blue-400" />
+                <div>
+                  <span className="text-sm font-medium">Procesează pe Server</span>
+                  <p className="text-xs text-muted-foreground">
+                    ffmpeg pe server — fără limită de memorie, crop central
+                  </p>
+                </div>
+              </div>
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={startingBackend || serverProcessing}
+                onClick={async () => {
+                  if (!jobId) return;
+                  setStartingBackend(true);
+                  try {
+                    // First trigger backend processing (transcribe + AI)
+                    await startProcessing({ jobId: jobId as Id<"jobs"> });
+                    toast.info("Procesare pornită — serverul va genera shorts-urile automat.");
+                  } catch (_err) {
+                    console.error("Server processJob failed:", _err);
+                    toast.error("Eroare la pornirea procesării pe server");
+                  } finally {
+                    setStartingBackend(false);
+                  }
+                }}
+              >
+                {startingBackend ? (
+                  <>
+                    <Loader2 className="size-4 mr-1.5 animate-spin" />
+                    Se pornește...
+                  </>
+                ) : (
+                  <>
+                    <Server className="size-4 mr-1.5" />
+                    Start Server
+                  </>
+                )}
+              </Button>
+            </div>
+          </div>
+
+          {/* Tertiary: Download Script */}
           <Collapsible>
             <CollapsibleTrigger className="w-full">
               <div className="border rounded-xl p-4 hover:bg-accent/30 transition-colors flex items-center justify-between">
@@ -683,6 +732,37 @@ export function JobDetailPage() {
                       face detection → crop 9:16 → subtitrări → encode MP4.
                     </p>
                   </div>
+                </div>
+                {/* Server processing option */}
+                <div className="mt-3 pt-3 border-t border-primary/20 flex items-center justify-between">
+                  <span className="text-xs text-muted-foreground">
+                    Video prea mare pentru browser?
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="text-xs h-7"
+                    disabled={serverProcessing}
+                    onClick={async () => {
+                      if (!jobId) return;
+                      setServerProcessing(true);
+                      try {
+                        await processOnServer({ jobId: jobId as Id<"jobs"> });
+                        toast.success("Procesare server finalizată!");
+                      } catch (_err) {
+                        console.error("Server processing failed:", _err);
+                        toast.error("Eroare procesare server");
+                      } finally {
+                        setServerProcessing(false);
+                      }
+                    }}
+                  >
+                    {serverProcessing ? (
+                      <><Loader2 className="size-3 mr-1 animate-spin" /> Server...</>
+                    ) : (
+                      <><Server className="size-3 mr-1" /> Procesează pe Server</>
+                    )}
+                  </Button>
                 </div>
               </div>
             )}

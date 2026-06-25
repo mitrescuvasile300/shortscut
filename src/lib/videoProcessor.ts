@@ -22,6 +22,11 @@ import {
   prewarmFaceDetector,
   type TrackingKeyframe,
 } from "./faceDetection";
+import {
+  downloadClipSegment,
+  getFileSize,
+  supportsRangeRequests,
+} from "./segmentDownloader";
 
 let ffmpegInstance: FFmpeg | null = null;
 let ffmpegLoaded = false;
@@ -946,6 +951,241 @@ async function processClip(
   return data;
 }
 
+// ── Segmented pipeline (per-clip download) ─────────────────────────────
+/**
+ * Process clips by downloading only each clip's segment of the video.
+ * Uses mp4box.js to parse the MP4 header and produce valid fMP4 segments.
+ * This avoids downloading the full video into browser memory.
+ */
+async function processAllClipsSegmented(
+  videoUrl: string,
+  clips: ClipConfig[],
+  onProgress: ProgressCallback,
+  audioUrl: string | null | undefined,
+  ffmpegPromise: Promise<FFmpeg>,
+  prewarmPromise: Promise<void>,
+): Promise<Map<number, Blob>> {
+  const results = new Map<number, Blob>();
+
+  // Download full audio if separate (it's small, typically 2–10 MB)
+  let audioData: Uint8Array | null = null;
+  if (audioUrl) {
+    onProgress({
+      clipIndex: 0,
+      totalClips: clips.length,
+      stage: "downloading",
+      percent: 0,
+      message: "Se descarcă audio-ul...",
+    });
+    audioData = await downloadVideo(audioUrl, (p) =>
+      onProgress({
+        clipIndex: 0,
+        totalClips: clips.length,
+        stage: "downloading",
+        percent: Math.round(p * 0.3),
+        message: `Se descarcă audio... ${p}%`,
+      }),
+    );
+    console.log(
+      `[segmented] Audio: ${(audioData.length / 1e6).toFixed(1)} MB`,
+    );
+  }
+
+  const ffmpeg = await ffmpegPromise;
+  await prewarmPromise;
+
+  if (audioData) {
+    await ffmpeg.writeFile("audio.m4a", audioData);
+  }
+
+  for (let i = 0; i < clips.length; i++) {
+    const clip = clips[i];
+    const n = i + 1;
+
+    try {
+      // ── 1. Download clip segment ─────────────────────────────────
+      onProgress({
+        clipIndex: n,
+        totalClips: clips.length,
+        stage: "downloading",
+        percent: 0,
+        message: `Se descarcă segmentul ${n}/${clips.length}...`,
+      });
+
+      const seg = await downloadClipSegment(
+        videoUrl,
+        clip.startTime,
+        clip.endTime,
+        (p) =>
+          onProgress({
+            clipIndex: n,
+            totalClips: clips.length,
+            stage: "downloading",
+            percent: p,
+            message: `Se descarcă segmentul ${n}/${clips.length}... ${p}%`,
+          }),
+      );
+
+      // ── 2. Write to ffmpeg FS ────────────────────────────────────
+      await ffmpeg.writeFile("source.mp4", seg.data);
+
+      // ── 3. Mux with audio if separate ────────────────────────────
+      if (audioData) {
+        onProgress({
+          clipIndex: n,
+          totalClips: clips.length,
+          stage: "loading",
+          percent: 0,
+          message: "Se combină video + audio...",
+        });
+        const audioSeek = Math.max(0, clip.startTime - 15);
+        const muxDur = clip.endTime - clip.startTime + 30;
+        await ffmpeg.exec([
+          "-i",
+          "source.mp4",
+          "-ss",
+          audioSeek.toFixed(3),
+          "-i",
+          "audio.m4a",
+          "-t",
+          muxDur.toFixed(3),
+          "-map",
+          "0:v",
+          "-map",
+          "1:a",
+          "-c",
+          "copy",
+          "-y",
+          "muxed.mp4",
+        ]);
+        await ffmpeg.deleteFile("source.mp4").catch(() => {});
+        const muxData = (await ffmpeg.readFile(
+          "muxed.mp4",
+        )) as Uint8Array;
+        await ffmpeg.writeFile("source.mp4", muxData);
+        await ffmpeg.deleteFile("muxed.mp4").catch(() => {});
+      }
+
+      // ── 4. Face detection ────────────────────────────────────────
+      const vW = seg.videoWidth;
+      const vH = seg.videoHeight;
+
+      if (vW > 0 && vH > 0) {
+        onProgress({
+          clipIndex: n,
+          totalClips: clips.length,
+          stage: "detecting",
+          percent: 0,
+          message: `🎯 Face detection ${n}/${clips.length}: ${clip.title}`,
+        });
+        try {
+          const dur = clip.endTime - clip.startTime;
+          const fps = dur <= 60 ? 4 : dur <= 120 ? 2 : 1;
+          const { numFrames, getFrame, cleanup } =
+            await extractFramesViaFfmpeg(
+              ffmpeg,
+              clip.startTime,
+              dur,
+              fps,
+              vW,
+              vH,
+            );
+          try {
+            const plan = await planClipCropFromFrames({
+              frameProvider: getFrame,
+              numFrames,
+              fps,
+              clipStartTime: clip.startTime,
+              clipEndTime: clip.endTime,
+              videoWidth: vW,
+              videoHeight: vH,
+            });
+            clip.cropPlan = plan;
+            const desc = plan.segments
+              .map(
+                (s: CropSegment) =>
+                  `${s.mode}@${s.startTime.toFixed(1)}-${s.endTime.toFixed(1)}s`,
+              )
+              .join(" | ");
+            console.log(
+              `[segmented] Clip ${n}: ${numFrames} frames @ ${fps}fps → ${desc}`,
+            );
+          } finally {
+            await cleanup();
+          }
+        } catch (err) {
+          console.warn(
+            `[segmented] Face detection clip ${n} failed:`,
+            err,
+          );
+        }
+      }
+
+      // ── 5. Process clip ──────────────────────────────────────────
+      onProgress({
+        clipIndex: n,
+        totalClips: clips.length,
+        stage: "processing",
+        percent: Math.round((i / clips.length) * 100),
+        message: `Se procesează Short ${n}/${clips.length}: ${clip.title}`,
+      });
+
+      const clipDuration = clip.endTime - clip.startTime;
+      ffmpeg.on("progress", ({ time }) => {
+        const cp = Math.min(
+          100,
+          Math.round((time / 1_000_000 / clipDuration) * 100),
+        );
+        onProgress({
+          clipIndex: n,
+          totalClips: clips.length,
+          stage: "encoding",
+          percent: Math.round(
+            ((i + cp / 100) / clips.length) * 100,
+          ),
+          message: `Se encodează Short ${n}/${clips.length}... ${cp}%`,
+        });
+      });
+
+      const outputData = await processClip(ffmpeg, clip, vW, vH);
+      results.set(
+        clip.index,
+        new Blob([outputData.buffer as ArrayBuffer], {
+          type: "video/mp4",
+        }),
+      );
+
+      // ── 6. Clean up segment from ffmpeg FS ───────────────────────
+      await ffmpeg.deleteFile("source.mp4").catch(() => {});
+    } catch (err) {
+      console.error(`[segmented] Error clip ${n}:`, err);
+      onProgress({
+        clipIndex: n,
+        totalClips: clips.length,
+        stage: "error",
+        percent: 0,
+        message: `Eroare la Short ${n}: ${
+          err instanceof Error ? err.message : "Eroare necunoscută"
+        }`,
+      });
+    }
+  }
+
+  // Final cleanup
+  if (audioData) await ffmpeg.deleteFile("audio.m4a").catch(() => {});
+  disposeFaceDetector();
+
+  onProgress({
+    clipIndex: clips.length,
+    totalClips: clips.length,
+    stage: "done",
+    percent: 100,
+    message: `✅ ${results.size}/${clips.length} shorts generate!`,
+  });
+
+  return results;
+}
+
 // ── Main pipeline ──────────────────────────────────────────────────────
 export async function processAllClips(
   videoUrl: string,
@@ -969,6 +1209,50 @@ export async function processAllClips(
   // ffmpeg load can run in parallel with the prewarm
   const ffmpegPromise = getFFmpeg(onProgress);
 
+  // ── Decide download strategy ─────────────────────────────────────
+  // For large files (>50 MB), use per-clip segment download to avoid
+  // allocating the full video in browser memory (fixes "Array buffer
+  // allocation failed" with 4K / long videos).
+  let useSegmented = false;
+  try {
+    const [rangeOk, totalSize] = await Promise.all([
+      supportsRangeRequests(videoUrl),
+      getFileSize(videoUrl),
+    ]);
+    if (rangeOk && totalSize > 50 * 1024 * 1024) {
+      console.log(
+        `[processAllClips] ${(totalSize / 1e6).toFixed(0)} MB > 50 MB threshold → segment download`,
+      );
+      useSegmented = true;
+    } else if (rangeOk && totalSize > 0) {
+      console.log(
+        `[processAllClips] ${(totalSize / 1e6).toFixed(0)} MB ≤ 50 MB → full download`,
+      );
+    }
+  } catch (e) {
+    console.log("[processAllClips] Could not probe file, using full download:", e);
+  }
+
+  if (useSegmented) {
+    try {
+      return await processAllClipsSegmented(
+        videoUrl,
+        clips,
+        onProgress,
+        audioUrl,
+        ffmpegPromise,
+        prewarm,
+      );
+    } catch (e) {
+      console.warn(
+        "[processAllClips] Segment download failed, falling back to full download:",
+        e,
+      );
+      // Fall through to original full-download approach
+    }
+  }
+
+  // ── Full download (original approach) ────────────────────────────
   onProgress({
     clipIndex: 0,
     totalClips: clips.length,

@@ -1947,6 +1947,8 @@ export const getJobInternal = internalQuery({
       minDuration: v.number(),
       maxDuration: v.number(),
       status: v.string(),
+      videoDownloadUrl: v.optional(v.string()),
+      audioDownloadUrl: v.optional(v.string()),
     }),
     v.null(),
   ),
@@ -1963,6 +1965,8 @@ export const getJobInternal = internalQuery({
       minDuration: job.minDuration,
       maxDuration: job.maxDuration,
       status: job.status,
+      videoDownloadUrl: job.videoDownloadUrl,
+      audioDownloadUrl: job.audioDownloadUrl,
     };
   },
 });
@@ -1971,6 +1975,8 @@ export const getClipsInternal = internalQuery({
   args: { jobId: v.id("jobs") },
   returns: v.array(
     v.object({
+      _id: v.id("clips"),
+      userId: v.id("users"),
       title: v.string(),
       startTime: v.number(),
       endTime: v.number(),
@@ -1986,6 +1992,8 @@ export const getClipsInternal = internalQuery({
       .withIndex("by_jobId", q => q.eq("jobId", jobId))
       .collect();
     return clips.map(c => ({
+      _id: c._id,
+      userId: c.userId,
       title: c.title,
       startTime: c.startTime,
       endTime: c.endTime,
@@ -1994,6 +2002,31 @@ export const getClipsInternal = internalQuery({
       hookLine: c.hookLine,
       caption: c.caption,
     }));
+  },
+});
+
+export const getClipInternal = internalQuery({
+  args: { clipId: v.id("clips") },
+  returns: v.union(
+    v.object({
+      _id: v.id("clips"),
+      userId: v.id("users"),
+      title: v.string(),
+      startTime: v.number(),
+      endTime: v.number(),
+    }),
+    v.null(),
+  ),
+  handler: async (ctx, { clipId }) => {
+    const clip = await ctx.db.get(clipId);
+    if (!clip) return null;
+    return {
+      _id: clip._id,
+      userId: clip.userId,
+      title: clip.title,
+      startTime: clip.startTime,
+      endTime: clip.endTime,
+    };
   },
 });
 
