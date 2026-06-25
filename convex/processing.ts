@@ -2031,3 +2031,39 @@ export const getClipInternal = internalQuery({
 });
 
 // extractVideoId defined above
+
+// Internal mutation for upserting a short (used by serverProcessing)
+export const upsertShort = internalMutation({
+  args: {
+    clipId: v.id("clips"),
+    jobId: v.id("jobs"),
+    userId: v.id("users"),
+    storageId: v.id("_storage"),
+    fileName: v.string(),
+    duration: v.number(),
+    fileSize: v.number(),
+    hasSubtitles: v.boolean(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const existing = await ctx.db
+      .query("shorts")
+      .withIndex("by_clipId", (q) => q.eq("clipId", args.clipId))
+      .unique();
+    if (existing) {
+      await ctx.storage.delete(existing.storageId);
+      await ctx.db.delete(existing._id);
+    }
+    await ctx.db.insert("shorts", {
+      clipId: args.clipId,
+      jobId: args.jobId,
+      userId: args.userId,
+      storageId: args.storageId,
+      fileName: args.fileName,
+      duration: args.duration,
+      fileSize: args.fileSize,
+      hasSubtitles: args.hasSubtitles,
+    });
+    return null;
+  },
+});

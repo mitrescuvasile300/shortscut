@@ -15,88 +15,23 @@
  *   - Memory: 512 MB max
  */
 
-import { action, internalAction, internalMutation } from "./_generated/server";
+import { action, internalAction } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { v } from "convex/values";
 import { getAuthUserId } from "@convex-dev/auth/server";
-import type { Id } from "./_generated/dataModel";
+// Id type used indirectly via v.id() validators
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-/** Fetch a byte range from a URL */
-async function fetchRange(
-  url: string,
-  start: number,
-  end: number,
-): Promise<ArrayBuffer> {
-  const resp = await fetch(url, {
-    headers: { Range: `bytes=${start}-${end}` },
-  });
-  if (!resp.ok && resp.status !== 206) {
-    throw new Error(`Range fetch failed: ${resp.status}`);
-  }
-  return resp.arrayBuffer();
-}
-
-/** Download full file or use Range if available */
+/** Download full file */
 async function downloadFull(url: string): Promise<Uint8Array> {
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
   return new Uint8Array(await resp.arrayBuffer());
 }
 
-/** Download a time range of the video using byte range estimation */
-async function downloadVideoSegment(
-  url: string,
-  startTime: number,
-  endTime: number,
-): Promise<Uint8Array> {
-  // Get file size
-  const probe = await fetch(url, { headers: { Range: "bytes=0-0" } });
-  let fileSize = 0;
-  if (probe.status === 206) {
-    const m = probe.headers.get("Content-Range")?.match(/\/(\d+)/);
-    if (m) fileSize = Number(m[1]);
-  }
-
-  // If we can't determine size or it's small, download fully
-  if (!fileSize || fileSize < 50 * 1024 * 1024) {
-    console.log(
-      `[serverProc] File ${fileSize ? (fileSize / 1e6).toFixed(0) + "MB" : "unknown size"}, downloading fully`,
-    );
-    return downloadFull(url);
-  }
-
-  // Download header (moov) + estimated clip range
-  // YouTube / Piped MP4s are typically faststart (moov at beginning)
-  const HEADER_SIZE = 3 * 1024 * 1024; // 3MB for moov
-  const headerData = await fetchRange(url, 0, HEADER_SIZE - 1);
-
-  // Estimate clip byte range (coarse but works for server-side)
-  // We'll download generously since we have more memory on the server
-  const estByterate = fileSize / 600; // assume ~10 min video as fallback
-  const clipStart = Math.max(0, startTime - 15);
-  const clipEnd = endTime + 15;
-  const startByte = Math.max(
-    HEADER_SIZE,
-    Math.floor((clipStart / 600) * fileSize),
-  );
-  const endByte = Math.min(fileSize - 1, Math.ceil((clipEnd / 600) * fileSize));
-  const clipData = await fetchRange(url, startByte, endByte);
-
-  // Combine header + clip data
-  const result = new Uint8Array(
-    headerData.byteLength + clipData.byteLength,
-  );
-  result.set(new Uint8Array(headerData), 0);
-  result.set(new Uint8Array(clipData), headerData.byteLength);
-
-  console.log(
-    `[serverProc] Downloaded ${(result.length / 1e6).toFixed(1)}MB ` +
-      `(header + clip ${startTime.toFixed(0)}→${endTime.toFixed(0)}s)`,
-  );
-  return result;
-}
+// downloadVideoSegment removed — server currently uses downloadFull
+// Can be re-added when range-based downloading is needed
 
 // ── Process a single clip on server ──────────────────────────────────
 
@@ -255,19 +190,14 @@ export const processClipOnServer = internalAction({
       }
 
       // Upload to Convex storage
-      const blob = new Blob([outputData], { type: "video/mp4" });
+      const blob = new Blob([outputData.buffer as ArrayBuffer], { type: "video/mp4" });
       const storageId = await ctx.storage.store(blob);
 
       // Save the short record
-      const job = await ctx.runQuery(
-        internal.processing.getJobInternal,
-        { jobId: args.jobId },
-      );
-
       const safeTitle = `clip_${args.clipIndex + 1}`;
       const fileName = `${String(args.clipIndex + 1).padStart(2, "0")}_${safeTitle}.mp4`;
 
-      await ctx.runMutation(internal.serverProcessing.saveServerShort, {
+      await ctx.runAction(internal.serverProcessing.saveServerShort, {
         clipId: args.clipId,
         jobId: args.jobId,
         storageId,
@@ -312,7 +242,7 @@ export const saveServerShort = internalAction({
     if (!clip) throw new Error("Clip not found");
 
     // Check for existing short
-    await ctx.runMutation(internal.serverProcessing.upsertShort, {
+    await ctx.runMutation(internal.processing.upsertShort, {
       clipId: args.clipId,
       jobId: args.jobId,
       userId: clip.userId,
@@ -327,44 +257,7 @@ export const saveServerShort = internalAction({
   },
 });
 
-// Internal mutation for upserting a short
-export const upsertShort = internalMutation({
-  args: {
-    clipId: v.id("clips"),
-    jobId: v.id("jobs"),
-    userId: v.id("users"),
-    storageId: v.id("_storage"),
-    fileName: v.string(),
-    duration: v.number(),
-    fileSize: v.number(),
-    hasSubtitles: v.boolean(),
-  },
-  returns: v.null(),
-  handler: async (ctx, args) => {
-    // Delete existing short for this clip if any
-    const existing = await ctx.db
-      .query("shorts")
-      .withIndex("by_clipId", (q) => q.eq("clipId", args.clipId))
-      .unique();
-    if (existing) {
-      await ctx.storage.delete(existing.storageId);
-      await ctx.db.delete(existing._id);
-    }
-
-    await ctx.db.insert("shorts", {
-      clipId: args.clipId,
-      jobId: args.jobId,
-      userId: args.userId,
-      storageId: args.storageId,
-      fileName: args.fileName,
-      duration: args.duration,
-      fileSize: args.fileSize,
-      hasSubtitles: args.hasSubtitles,
-    });
-
-    return null;
-  },
-});
+// upsertShort mutation lives in processing.ts (non-Node file)
 
 // ── Orchestrator: process all clips for a job on server ─────────────
 
