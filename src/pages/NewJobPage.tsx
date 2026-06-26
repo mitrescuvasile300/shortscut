@@ -1,4 +1,4 @@
-import { useAction, useMutation, useQuery } from "convex/react";
+import { useMutation, useQuery } from "convex/react";
 import { ArrowLeft, Loader2, Sparkles } from "lucide-react";
 import { useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
@@ -19,7 +19,7 @@ import { api } from "../../convex/_generated/api";
 export function NewJobPage() {
   const navigate = useNavigate();
   const createJob = useMutation(api.jobs.create);
-  const startProcessing = useAction(api.processing.processJob);
+  // User picks Browser or Server processing on the job detail page
   const settings = useQuery(api.settings.get);
 
   const [videoUrl, setVideoUrl] = useState("");
@@ -48,15 +48,7 @@ export function NewJobPage() {
         maxDuration: durationRange[1],
       });
 
-      // Start backend processing (download → transcribe → AI analysis)
-      // This runs on the server; the job page will auto-generate shorts in browser
-      // when the backend reaches "generating" status
-      startProcessing({ jobId }).catch(err => {
-        console.error("[NewJobPage] processJob failed:", err);
-        // Job page will show the error via job.status === "failed"
-      });
-
-      toast.success("Procesarea a început! Se analizează video-ul...");
+      toast.success("Job creat! Alege modul de procesare.");
       navigate(`/job/${jobId}`);
     } catch (_err) {
       toast.error("Eroare la crearea job-ului");
