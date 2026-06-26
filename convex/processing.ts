@@ -1979,6 +1979,7 @@ export const getJobInternal = internalQuery({
       status: v.string(),
       videoDownloadUrl: v.optional(v.string()),
       audioDownloadUrl: v.optional(v.string()),
+      transcriptSegments: v.optional(v.string()),
     }),
     v.null(),
   ),
@@ -1997,6 +1998,7 @@ export const getJobInternal = internalQuery({
       status: job.status,
       videoDownloadUrl: job.videoDownloadUrl,
       audioDownloadUrl: job.audioDownloadUrl,
+      transcriptSegments: job.transcriptSegments,
     };
   },
 });

@@ -200,11 +200,13 @@ export function JobDetailPage() {
   const markJobCompleted = useMutation(api.shorts.markJobCompleted);
   const refreshVideoUrl = useAction(api.processing.refreshVideoUrl);
   const startProcessing = useAction(api.processing.processJob);
+  const startServerProcessing = useAction(api.serverProcessing.processJobOnServer);
 
 
   const [processing, setProcessing] = useState(false);
   const [startingBackend, setStartingBackend] = useState(false);
   const [serverProcessing, setServerProcessing] = useState(false);
+  const serverModeRef = useRef(false);
   const [progress, setProgress] = useState<ProcessingProgress | null>(null);
   const [generatedBlobs, setGeneratedBlobs] = useState<
     Map<number, { blob: Blob; url: string }>
@@ -379,7 +381,8 @@ export function JobDetailPage() {
       shorts !== undefined &&
       shorts.length === 0 &&
       !processing &&
-      !autoGenerateTriggered.current
+      !autoGenerateTriggered.current &&
+      !serverModeRef.current
     ) {
       autoGenerateTriggered.current = true;
       console.log("[AutoGenerate] Starting automatic short generation...");
@@ -543,40 +546,55 @@ export function JobDetailPage() {
           </div>
 
           {/* Secondary: Process on Server */}
-          <div className="border rounded-xl p-4 hover:bg-accent/10 transition-colors">
+          <div className="border border-blue-500/30 rounded-xl p-4 hover:bg-blue-500/5 transition-colors">
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-3">
                 <Server className="size-5 text-blue-400" />
                 <div>
                   <span className="text-sm font-medium">Procesează pe Server</span>
                   <p className="text-xs text-muted-foreground">
-                    ffmpeg pe server — fără limită de memorie, crop central
+                    ffmpeg nativ pe VPS — fără limită de memorie, orice dimensiune video
                   </p>
                 </div>
               </div>
               <Button
                 size="sm"
                 variant="outline"
+                className="border-blue-500/50 text-blue-400 hover:bg-blue-500/10"
                 disabled={startingBackend || serverProcessing}
                 onClick={async () => {
                   if (!jobId) return;
+                  serverModeRef.current = true;
                   setStartingBackend(true);
                   try {
-                    // First trigger backend processing (transcribe + AI)
+                    // First trigger backend pipeline (transcribe + AI analysis)
                     await startProcessing({ jobId: jobId as Id<"jobs"> });
-                    toast.info("Procesare pornită — serverul va genera shorts-urile automat.");
+                    toast.info("Analiză completă — pornesc procesarea pe server...");
+                    // Now trigger VPS processing
+                    setServerProcessing(true);
+                    setStartingBackend(false);
+                    await startServerProcessing({ jobId: jobId as Id<"jobs"> });
+                    toast.success("Shorts-urile au fost generate pe server! 🎉");
                   } catch (_err) {
-                    console.error("Server processJob failed:", _err);
-                    toast.error("Eroare la pornirea procesării pe server");
+                    console.error("Server processing failed:", _err);
+                    const msg = _err instanceof Error ? _err.message : "Eroare necunoscută";
+                    toast.error(`Eroare procesare server: ${msg}`);
                   } finally {
                     setStartingBackend(false);
+                    setServerProcessing(false);
+                    serverModeRef.current = false;
                   }
                 }}
               >
                 {startingBackend ? (
                   <>
                     <Loader2 className="size-4 mr-1.5 animate-spin" />
-                    Se pornește...
+                    Analiză...
+                  </>
+                ) : serverProcessing ? (
+                  <>
+                    <Loader2 className="size-4 mr-1.5 animate-spin" />
+                    Procesare VPS...
                   </>
                 ) : (
                   <>
