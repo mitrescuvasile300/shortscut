@@ -749,6 +749,10 @@ const PIPED_INSTANCES = [
 const PIPED_PROXY_URL = "http://76.13.133.153:3457";
 const PIPED_PROXY_KEY = "shortcut-piped-2026";
 
+// VPS processing server (yt-dlp based — residential IP, bypasses YouTube bot detection)
+const VPS_PROCESS_URL = "http://76.13.133.153:3458";
+const VPS_PROCESS_KEY = "shortcut-vps-2026";
+
 /**
  * Fetch with timeout using AbortController (Convex fetch has no built-in timeout)
  */
@@ -1687,7 +1691,58 @@ export const processJob = action({
         }
       }
 
-      // 2c. Last resort: Whisper (downloads full audio — slow but works for any video)
+      // 2c. VPS yt-dlp transcript fallback (VPS has residential IP, bypasses YouTube bot detection)
+      if (!transcriptResult) {
+        try {
+          console.log("[processJob] Trying VPS yt-dlp transcript fallback...");
+          const vpsTranscriptResp = await fetchWithTimeout(
+            `${VPS_PROCESS_URL}/transcript`,
+            {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "X-API-Key": VPS_PROCESS_KEY,
+              },
+              body: JSON.stringify({
+                video_url: job.videoUrl,
+                lang: job.language || "en",
+              }),
+              timeout: 120000,
+            },
+          );
+          if (vpsTranscriptResp.ok) {
+            const vpsData = await vpsTranscriptResp.json();
+            if (vpsData.success && vpsData.segments?.length > 0) {
+              transcriptResult = {
+                segments: vpsData.segments.map(
+                  (s: { start: number; end: number; text: string }) => ({
+                    start: s.start,
+                    end: s.end,
+                    text: s.text,
+                  }),
+                ),
+                text: vpsData.segments
+                  .map((s: { text: string }) => s.text)
+                  .join(" "),
+              };
+              console.log(
+                `[processJob] VPS transcript OK: ${transcriptResult.segments.length} segments`,
+              );
+            }
+          } else {
+            const errText = await vpsTranscriptResp.text();
+            console.log(
+              `[processJob] VPS transcript HTTP ${vpsTranscriptResp.status}: ${errText.slice(0, 200)}`,
+            );
+          }
+        } catch (err) {
+          console.log(
+            `[processJob] VPS transcript failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+
+      // 2d. Last resort: Whisper (downloads full audio — slow but works for any video)
       if (!transcriptResult && openaiKey) {
         const audioUrl =
           piped?.audioUrl ||
@@ -1708,9 +1763,11 @@ export const processJob = action({
 
       if (!transcriptResult || transcriptResult.segments.length === 0) {
         throw new Error(
-          "Nu am putut obține transcriptul. Verifică:\n" +
-            "1. Video-ul are subtitrări auto-generate pe YouTube\n" +
-            "2. Sau ai setat OpenAI API Key în Settings (folosește Whisper ca fallback)",
+          "Nu am putut obține transcriptul. YouTube blochează video-uri de pe IP-uri cloud.\n" +
+            "Soluții:\n" +
+            "1. Verifică că VPS-ul e pornit (endpoint /transcript)\n" +
+            "2. Adaugă YouTube cookies în Settings\n" +
+            "3. Setează OpenAI API Key în Settings (Whisper fallback)",
         );
       }
 
@@ -2000,6 +2057,32 @@ export const getJobInternal = internalQuery({
       audioDownloadUrl: job.audioDownloadUrl,
       transcriptSegments: job.transcriptSegments,
     };
+  },
+});
+
+// Temporary debug query — list recent jobs
+export const listJobsInternal = internalQuery({
+  args: {},
+  returns: v.array(
+    v.object({
+      _id: v.id("jobs"),
+      videoUrl: v.string(),
+      videoTitle: v.optional(v.string()),
+      status: v.string(),
+      error: v.optional(v.string()),
+      _creationTime: v.number(),
+    }),
+  ),
+  handler: async (ctx) => {
+    const jobs = await ctx.db.query("jobs").order("desc").take(20);
+    return jobs.map((j) => ({
+      _id: j._id,
+      videoUrl: j.videoUrl,
+      videoTitle: j.videoTitle,
+      status: j.status,
+      error: j.error,
+      _creationTime: j._creationTime,
+    }));
   },
 });
 
