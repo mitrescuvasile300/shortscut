@@ -1706,6 +1706,7 @@ export const processJob = action({
               body: JSON.stringify({
                 video_url: job.videoUrl,
                 lang: job.language || "en",
+                cookies: cookieHeader || undefined,
               }),
               timeout: 120000,
             },

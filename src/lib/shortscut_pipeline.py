@@ -48,8 +48,12 @@ SILENCE_PADDING = 0.12       # seconds kept at each cut boundary for natural tra
 # ─────────────────────────── venv bootstrap ──────────────────────
 def ensure_venv():
     """Create venv and install deps if needed. Returns path to venv Python."""
-    pip = VENV_DIR / "bin" / "pip"
-    python = VENV_DIR / "bin" / "python"
+    if sys.platform == "win32":
+        pip = VENV_DIR / "Scripts" / "pip.exe"
+        python = VENV_DIR / "Scripts" / "python.exe"
+    else:
+        pip = VENV_DIR / "bin" / "pip"
+        python = VENV_DIR / "bin" / "python"
 
     if not python.exists():
         print("📦 Creating virtual environment...")
@@ -125,9 +129,13 @@ def setup_ffmpeg(python_path: str):
 
 def ensure_tools(need_ytdlp: bool):
     """Check ffmpeg and yt-dlp (if downloading)."""
+    is_win = sys.platform == "win32"
     if not shutil.which("ffmpeg"):
         print("❌ 'ffmpeg' not found — and static-ffmpeg didn't set it up.")
-        print("   Install manually: brew install ffmpeg (macOS) / apt install ffmpeg (Linux)")
+        if is_win:
+            print("   Windows: winget install ffmpeg  SAU  https://www.gyan.dev/ffmpeg/builds/")
+        else:
+            print("   Install manually: brew install ffmpeg (macOS) / apt install ffmpeg (Linux)")
         sys.exit(1)
 
     # Quick libass check
@@ -135,14 +143,20 @@ def ensure_tools(need_ytdlp: bool):
         r = subprocess.run(["ffmpeg", "-filters"], capture_output=True, text=True, timeout=10)
         if "libass" not in r.stdout and " ass " not in r.stdout:
             print("⚠️  ffmpeg may not have libass. Subtitles might not burn correctly.")
-            print("  macOS: brew install ffmpeg | Linux: sudo apt install ffmpeg libass-dev")
+            if is_win:
+                print("  Windows: descarcă ffmpeg-full de pe https://www.gyan.dev/ffmpeg/builds/")
+            else:
+                print("  macOS: brew install ffmpeg | Linux: sudo apt install ffmpeg libass-dev")
     except Exception:
         pass
 
     if need_ytdlp and not shutil.which("yt-dlp"):
         print("❌ 'yt-dlp' not found. Install it first.")
-        print("   brew install yt-dlp   (macOS)")
-        print("   pip install yt-dlp    (Linux)")
+        if is_win:
+            print("   Windows: pip install yt-dlp  SAU  winget install yt-dlp")
+        else:
+            print("   brew install yt-dlp   (macOS)")
+            print("   pip install yt-dlp    (Linux)")
         sys.exit(1)
 
 

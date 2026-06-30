@@ -627,41 +627,73 @@ export function JobDetailPage() {
                     download video → transcriere Whisper → analiză AI → face
                     crop 9:16 → burn subtitrări.
                   </p>
-                  <Button
-                    size="lg"
-                    variant="outline"
-                    className="w-full max-w-xs h-11"
-                    onClick={() => {
-                      if (!job) return;
-                      const videoId =
-                        job.videoUrl.match(
-                          /(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/,
-                        )?.[1] || "video";
-                      downloadScript(
-                        {
-                          videoUrl: job.videoUrl,
-                          language: job.language,
-                          numShorts: job.numShorts,
-                          minDuration: job.minDuration,
-                          maxDuration: job.maxDuration,
-                          openaiApiKey: settings?.openaiApiKey || undefined,
-                        },
-                        `shortscut_${videoId}.sh`,
-                      );
-                      toast.success(
-                        "Script descărcat! Rulează-l local cu: chmod +x shortscut_*.sh && ./shortscut_*.sh",
-                      );
-                    }}
-                  >
-                    <Download className="size-5 mr-2" />
-                    Descarcă .sh
-                  </Button>
+                  <div className="flex gap-2 w-full max-w-xs">
+                    <Button
+                      size="lg"
+                      variant="outline"
+                      className="flex-1 h-11"
+                      onClick={() => {
+                        if (!job) return;
+                        const videoId =
+                          job.videoUrl.match(
+                            /(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/,
+                          )?.[1] || "video";
+                        downloadScript(
+                          {
+                            videoUrl: job.videoUrl,
+                            language: job.language,
+                            numShorts: job.numShorts,
+                            minDuration: job.minDuration,
+                            maxDuration: job.maxDuration,
+                            openaiApiKey: settings?.openaiApiKey || undefined,
+                          },
+                          "py",
+                          `shortscut_${videoId}.py`,
+                        );
+                        toast.success(
+                          "Script descărcat! Rulează: python shortscut_*.py",
+                        );
+                      }}
+                    >
+                      <Download className="size-5 mr-2" />
+                      Descarcă .py
+                    </Button>
+                    <Button
+                      size="lg"
+                      variant="ghost"
+                      className="h-11 px-3 text-muted-foreground"
+                      onClick={() => {
+                        if (!job) return;
+                        const videoId =
+                          job.videoUrl.match(
+                            /(?:v=|youtu\.be\/|shorts\/)([a-zA-Z0-9_-]{11})/,
+                          )?.[1] || "video";
+                        downloadScript(
+                          {
+                            videoUrl: job.videoUrl,
+                            language: job.language,
+                            numShorts: job.numShorts,
+                            minDuration: job.minDuration,
+                            maxDuration: job.maxDuration,
+                            openaiApiKey: settings?.openaiApiKey || undefined,
+                          },
+                          "sh",
+                          `shortscut_${videoId}.sh`,
+                        );
+                        toast.success(
+                          "Script descărcat! Rulează: chmod +x shortscut_*.sh && ./shortscut_*.sh",
+                        );
+                      }}
+                    >
+                      .sh
+                    </Button>
+                  </div>
                   <p className="text-xs text-muted-foreground">
                     Necesită: python3, ffmpeg, yt-dlp
                     {!settings?.openaiApiKey && " + OpenAI API key"}
                   </p>
                   <div className="text-xs text-muted-foreground bg-muted rounded-lg p-3 w-full max-w-md font-mono">
-                    chmod +x shortscut_*.sh && ./shortscut_*.sh
+                    python shortscut_*.py
                   </div>
                 </div>
               </div>

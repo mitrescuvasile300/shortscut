@@ -1,6 +1,9 @@
 /**
- * Generates a per-job .sh script that the user downloads and runs locally.
- * The script bootstraps a Python venv, installs deps, then runs the full pipeline:
+ * Generates per-job scripts that the user downloads and runs locally.
+ *   - .py  → cross-platform (Windows, macOS, Linux)
+ *   - .sh  → bash wrapper (macOS, Linux)
+ *
+ * The scripts bootstrap a Python venv, install deps, then run the full pipeline:
  *   yt-dlp download → Whisper → AI analysis → face crop → subtitle burn
  */
 
@@ -16,6 +19,57 @@ export interface JobScriptConfig {
   openaiApiKey?: string;
 }
 
+/**
+ * Generates a self-contained Python script that works on Windows, macOS, and Linux.
+ * No bash needed — just `python shortscut_<id>.py`
+ */
+export function generatePythonScript(config: JobScriptConfig): string {
+  const { videoUrl, language, numShorts, minDuration, maxDuration, openaiApiKey } = config;
+
+  // Escape for Python strings (backslash, then single quote)
+  const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+
+  // Strip the default __main__ guard from pipeline.py so our custom one runs instead
+  const pipelineCode = pythonContent
+    .replace(/\nif __name__\s*==\s*["']__main__["']:\s*\n\s*main\(\)\s*$/, "")
+    .trimEnd();
+
+  const lines = [
+    pipelineCode,
+    "",
+    "# ═══════════════════════════════════════════════════════════════",
+    "# Auto-generated job configuration — edit if needed",
+    "# ═══════════════════════════════════════════════════════════════",
+    "if __name__ == '__main__':",
+    "    import sys, os",
+    "",
+    `    _VIDEO_URL = '${esc(videoUrl)}'`,
+    `    _LANGUAGE = '${esc(language)}'`,
+    `    _NUM_SHORTS = ${numShorts}`,
+    `    _MIN_DURATION = ${minDuration}`,
+    `    _MAX_DURATION = ${maxDuration}`,
+    openaiApiKey
+      ? `    os.environ.setdefault('OPENAI_API_KEY', '${esc(openaiApiKey)}')`
+      : "    # OPENAI_API_KEY not set — the script will prompt you",
+    "",
+    "    sys.argv = [",
+    "        sys.argv[0],",
+    "        _VIDEO_URL,",
+    `        '--api-key', os.environ.get('OPENAI_API_KEY', ''),`,
+    `        '--language', _LANGUAGE,`,
+    `        '--num-shorts', str(_NUM_SHORTS),`,
+    `        '--min-duration', str(_MIN_DURATION),`,
+    `        '--max-duration', str(_MAX_DURATION),`,
+    "    ]",
+    "    main()",
+  ];
+
+  return lines.join("\n") + "\n";
+}
+
+/**
+ * Generates a bash .sh wrapper (macOS / Linux only).
+ */
 export function generateJobScript(config: JobScriptConfig): string {
   const { videoUrl, language, numShorts, minDuration, maxDuration, openaiApiKey } = config;
 
@@ -26,7 +80,6 @@ export function generateJobScript(config: JobScriptConfig): string {
     ? `export OPENAI_API_KEY='${esc(openaiApiKey)}'`
     : "# OPENAI_API_KEY not set — will prompt below";
 
-  // Build the script as an array of lines for clarity
   const lines = [
     "#!/usr/bin/env bash",
     "# ═══════════════════════════════════════════════════════════════",
@@ -132,13 +185,21 @@ export function generateJobScript(config: JobScriptConfig): string {
 /**
  * Triggers a browser download of the generated script.
  */
-export function downloadScript(config: JobScriptConfig, filename: string = "shortscut_job.sh") {
-  const content = generateJobScript(config);
-  const blob = new Blob([content], { type: "application/x-sh" });
+export function downloadScript(
+  config: JobScriptConfig,
+  format: "py" | "sh" = "py",
+  filename?: string,
+) {
+  const isPy = format === "py";
+  const content = isPy ? generatePythonScript(config) : generateJobScript(config);
+  const defaultName = isPy ? "shortscut_job.py" : "shortscut_job.sh";
+  const mimeType = isPy ? "text/x-python" : "application/x-sh";
+
+  const blob = new Blob([content], { type: mimeType });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = filename;
+  a.download = filename || defaultName;
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
