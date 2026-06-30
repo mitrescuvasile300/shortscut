@@ -46,6 +46,24 @@ SILENCE_PADDING = 0.12       # seconds kept at each cut boundary for natural tra
 
 
 # ─────────────────────────── venv bootstrap ──────────────────────
+def _find_compatible_python() -> str:
+    """Find a Python 3.9–3.13 interpreter (pydantic-core has no 3.14 wheels yet)."""
+    vi = sys.version_info
+    if 9 <= vi.minor <= 13:
+        return sys.executable  # current interpreter is fine
+
+    # Search for a compatible version (prefer newest)
+    for minor in (13, 12, 11, 10, 9):
+        for name in (f"python3.{minor}", f"python3{minor}"):
+            candidate = shutil.which(name)
+            if candidate:
+                print(f"⚠️  Python {vi.major}.{vi.minor} is too new for some deps; using {name}")
+                return candidate
+    # Last resort — try anyway
+    print(f"⚠️  Python {vi.major}.{vi.minor} detected — openai/pydantic may fail. Install Python 3.12 or 3.13.")
+    return sys.executable
+
+
 def ensure_venv():
     """Create venv and install deps if needed. Returns path to venv Python."""
     if sys.platform == "win32":
@@ -56,9 +74,10 @@ def ensure_venv():
         python = VENV_DIR / "bin" / "python"
 
     if not python.exists():
+        base_python = _find_compatible_python()
         print("📦 Creating virtual environment...")
         subprocess.check_call(
-            [sys.executable, "-m", "venv", str(VENV_DIR)],
+            [base_python, "-m", "venv", str(VENV_DIR)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         subprocess.check_call(
