@@ -336,6 +336,10 @@ export const startVpsFetch = action({
     });
     if (!job) throw new Error("Job not found");
 
+    const settings = await ctx.runQuery(internal.processing.getUserSettings, {
+      userId,
+    });
+
     try {
       const resp: Response = await fetch(`${VPS_URL}/fetch`, {
         method: "POST",
@@ -343,7 +347,10 @@ export const startVpsFetch = action({
           "Content-Type": "application/json",
           "X-API-Key": VPS_API_KEY,
         },
-        body: JSON.stringify({ video_url: job.videoUrl }),
+        body: JSON.stringify({
+          video_url: job.videoUrl,
+          cookies: settings?.youtubeCookies || undefined,
+        }),
       });
       const data = (await resp.json()) as {
         fetch_id?: string;

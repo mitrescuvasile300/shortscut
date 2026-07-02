@@ -1582,7 +1582,10 @@ async function analyzeTranscriptWithAI(
 
 export const processJob = action({
   args: { jobId: v.id("jobs") },
-  returns: v.null(),
+  returns: v.object({
+    success: v.boolean(),
+    error: v.optional(v.string()),
+  }),
   handler: async (ctx, { jobId }) => {
     const userId = await getAuthUserId(ctx);
     if (!userId) throw new Error("Not authenticated");
@@ -1706,7 +1709,10 @@ export const processJob = action({
               body: JSON.stringify({
                 video_url: job.videoUrl,
                 lang: job.language || "en",
-                cookies: cookieHeader || undefined,
+                // Raw cookies (Netscape or header format) — the VPS converts
+                // them to a cookies.txt for yt-dlp. cookieHeader loses the
+                // Netscape metadata yt-dlp wants.
+                cookies: settings?.youtubeCookies || undefined,
               }),
               timeout: 120000,
             },
@@ -1759,6 +1765,71 @@ export const processJob = action({
               `[processJob] Whisper failed: ${err instanceof Error ? err.message : String(err)}`,
             );
           }
+        }
+      }
+
+      // 2e. Whisper via VPS-downloaded audio. Cloud IPs usually can't reach
+      // googlevideo directly (2d fails), but the VPS can download the audio
+      // with yt-dlp and serve it back — then Whisper transcribes it.
+      if (!transcriptResult && openaiKey) {
+        try {
+          console.log("[processJob] Whisper via VPS audio fetch...");
+          const startResp = await fetchWithTimeout(`${VPS_PROCESS_URL}/fetch`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-API-Key": VPS_PROCESS_KEY,
+            },
+            body: JSON.stringify({
+              video_url: job.videoUrl,
+              format: "audio",
+              cookies: settings?.youtubeCookies || undefined,
+            }),
+            timeout: 30000,
+          });
+          if (startResp.ok) {
+            const startData = (await startResp.json()) as {
+              fetch_id?: string;
+            };
+            if (startData.fetch_id) {
+              const deadline = Date.now() + 5 * 60 * 1000;
+              let ready = false;
+              while (Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, 5000));
+                const stResp = await fetchWithTimeout(
+                  `${VPS_PROCESS_URL}/fetch-status?id=${encodeURIComponent(startData.fetch_id)}`,
+                  { timeout: 15000 },
+                );
+                const st = (await stResp.json()) as {
+                  status?: string;
+                  error?: string;
+                };
+                if (st.status === "ready") {
+                  ready = true;
+                  break;
+                }
+                if (st.status === "error") {
+                  console.log(`[processJob] VPS audio fetch error: ${st.error}`);
+                  break;
+                }
+              }
+              if (ready) {
+                transcriptResult = await transcribeWithWhisper(
+                  `${VPS_PROCESS_URL}/file/${startData.fetch_id}`,
+                  openaiKey,
+                );
+                if (transcriptResult) {
+                  console.log(
+                    `[processJob] Whisper (VPS audio) OK: ${transcriptResult.segments.length} segments`,
+                  );
+                }
+              }
+            }
+          }
+        } catch (err) {
+          console.log(
+            `[processJob] Whisper via VPS failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       }
 
@@ -1848,13 +1919,18 @@ export const processJob = action({
           : undefined, // 1 hour
       });
     } catch (error) {
+      const errorMsg =
+        error instanceof Error ? error.message : "Eroare necunoscută";
       await ctx.runMutation(internal.processing.updateJobStatus, {
         jobId,
         status: "failed",
-        error: error instanceof Error ? error.message : "Eroare necunoscută",
+        error: errorMsg,
       });
+      // Previously errors were swallowed (returned null) — the UI then
+      // happily continued to server processing with ZERO clips.
+      return { success: false, error: errorMsg };
     }
-    return null;
+    return { success: true };
   },
 });
 

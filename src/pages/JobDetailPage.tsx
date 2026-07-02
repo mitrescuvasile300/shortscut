@@ -620,7 +620,12 @@ export function JobDetailPage() {
                   if (!jobId) return;
                   setStartingBackend(true);
                   try {
-                    await startProcessing({ jobId: jobId as Id<"jobs"> });
+                    const res = await startProcessing({
+                      jobId: jobId as Id<"jobs">,
+                    });
+                    if (res && res.success === false) {
+                      toast.error(`Analiza a eșuat: ${res.error || "eroare necunoscută"}`);
+                    }
                   } catch (err) {
                     console.error("processJob failed:", err);
                     toast.error(
@@ -669,7 +674,14 @@ export function JobDetailPage() {
                   setStartingBackend(true);
                   try {
                     // First trigger backend pipeline (transcribe + AI analysis)
-                    await startProcessing({ jobId: jobId as Id<"jobs"> });
+                    const res = await startProcessing({
+                      jobId: jobId as Id<"jobs">,
+                    });
+                    if (res && res.success === false) {
+                      // Analysis failed → there are no clips; VPS processing
+                      // would only throw "Nu există clipuri pentru acest job"
+                      throw new Error(res.error || "Analiza a eșuat");
+                    }
                     toast.info("Analiză completă — pornesc procesarea pe server...");
                     // Now trigger VPS processing
                     setServerProcessing(true);
@@ -842,8 +854,14 @@ export function JobDetailPage() {
               if (!jobId) return;
               setStartingBackend(true);
               try {
-                await startProcessing({ jobId: jobId as Id<"jobs"> });
-                toast.success("Procesarea a reînceput!");
+                const res = await startProcessing({
+                  jobId: jobId as Id<"jobs">,
+                });
+                if (res && res.success === false) {
+                  toast.error(`Eroare: ${res.error || "necunoscută"}`);
+                } else {
+                  toast.success("Procesarea a reînceput!");
+                }
               } catch (err) {
                 toast.error(
                   `Eroare: ${err instanceof Error ? err.message : "Eroare necunoscută"}`,

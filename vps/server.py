@@ -46,6 +46,31 @@ fetch_jobs: dict[str, dict] = {}  # fetch_id -> {status, path, video_key, create
 FETCH_TTL = 2 * 3600
 
 
+def _write_cookies_file(cookies_text, dest_dir):
+    """Write user cookies to a Netscape cookies.txt for yt-dlp.
+    Accepts either Netscape format (tabs) or a raw Cookie header string."""
+    path = os.path.join(dest_dir, "cookies.txt")
+    txt = (cookies_text or "").strip()
+    if not txt:
+        return None
+    if "\t" in txt:  # already Netscape format
+        if not txt.startswith("#"):
+            txt = "# Netscape HTTP Cookie File\n" + txt
+        Path(path).write_text(txt + "\n", encoding="utf-8")
+        return path
+    lines = ["# Netscape HTTP Cookie File"]
+    for pair in txt.split(";"):
+        pair = pair.strip()
+        if "=" not in pair:
+            continue
+        name, _, value = pair.partition("=")
+        lines.append("\t".join([
+            ".youtube.com", "TRUE", "/", "TRUE", "0", name.strip(), value.strip()
+        ]))
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def _yt_video_key(url):
     m = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", url or "")
     return m.group(1) if m else (url or "")
@@ -60,30 +85,44 @@ def cleanup_old_fetches():
             log.info(f"Cleaned up fetched source: {fid}")
 
 
-def _fetch_worker(fetch_id, video_url):
-    """Background download of a source video via yt-dlp (720p mp4 + m4a, merged)."""
+def _fetch_worker(fetch_id, video_url, fmt="video", cookies_text=None):
+    """Background download of a source video/audio via yt-dlp."""
     info = fetch_jobs[fetch_id]
-    out_path = os.path.join(str(WORK_DIR), f"src_{fetch_id}.mp4")
+    ext = "m4a" if fmt == "audio" else "mp4"
+    out_path = os.path.join(str(WORK_DIR), f"src_{fetch_id}.{ext}")
     try:
-        args = [
-            "yt-dlp",
-            "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
-            "--merge-output-format", "mp4",
-            "-o", out_path,
-            "--no-playlist",
-            video_url,
-        ]
+        if fmt == "audio":
+            args = [
+                "yt-dlp",
+                "-f", "bestaudio[ext=m4a]/bestaudio",
+                "-o", out_path,
+                "--no-playlist",
+            ]
+        else:
+            args = [
+                "yt-dlp",
+                "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
+                "--merge-output-format", "mp4",
+                "-o", out_path,
+                "--no-playlist",
+            ]
+        cookies_path = _write_cookies_file(cookies_text, str(WORK_DIR)) if cookies_text else None
+        if cookies_path:
+            args += ["--cookies", cookies_path]
+        args.append(video_url)
         _, stderr, rc = run_cmd(args, timeout=900)
         if rc != 0 or not os.path.exists(out_path):
             raise RuntimeError(f"yt-dlp failed (rc={rc}): {stderr[-400:]}")
 
-        # Probe dimensions
+        # Probe dimensions (video only)
+        width, height = 0, 0
+        if fmt == "video":
+            width, height = 1280, 720
         stdout, _, prc = run_cmd([
             "ffprobe", "-v", "error", "-select_streams", "v:0",
             "-show_entries", "stream=width,height", "-of", "json", out_path,
         ], timeout=30)
-        width, height = 1280, 720
-        if prc == 0:
+        if prc == 0 and fmt == "video":
             try:
                 streams = json.loads(stdout).get("streams", [])
                 if streams:
@@ -759,11 +798,13 @@ class Handler(BaseHTTPRequestHandler):
             if not video_url:
                 self._json_response(400, {"error": "video_url required"})
                 return
+            fmt = body.get("format", "video")
+            cookies_text = body.get("cookies")
 
             cleanup_old_fetches()
 
-            # Dedupe: reuse an in-flight or ready fetch of the same video
-            key = _yt_video_key(video_url)
+            # Dedupe: reuse an in-flight or ready fetch of the same video+format
+            key = f"{_yt_video_key(video_url)}:{fmt}"
             for fid, info in fetch_jobs.items():
                 if info.get("video_key") == key and info["status"] in ("downloading", "ready"):
                     if info["status"] == "ready" and not os.path.exists(info.get("path", "")):
@@ -781,7 +822,9 @@ class Handler(BaseHTTPRequestHandler):
                 "size": 0,
             }
             threading.Thread(
-                target=_fetch_worker, args=(fetch_id, video_url), daemon=True
+                target=_fetch_worker,
+                args=(fetch_id, video_url, fmt, cookies_text),
+                daemon=True,
             ).start()
             log.info(f"[fetch] Started {fetch_id} for {video_url}")
             self._json_response(200, {"fetch_id": fetch_id, "status": "downloading"})
@@ -883,13 +926,26 @@ class Handler(BaseHTTPRequestHandler):
 
             video_url = body.get("video_url") or body.get("youtube_url")
             lang = body.get("lang", "en")
+            cookies_text = body.get("cookies")
             if not video_url:
                 self._json_response(400, {"error": "video_url required"})
                 return
 
+            # LANGUAGE FALLBACKS: the job language (e.g. "ro") often doesn't
+            # match the video's language (e.g. an English podcast). Asking
+            # yt-dlp for ONLY "ro" then returned zero files → 404 → the whole
+            # pipeline failed. Request the job language AND the original/
+            # English tracks in one pass; the parser prefers the first match.
+            lang_list = ",".join(dict.fromkeys([
+                lang, f"{lang}-orig", "en", "en-orig",
+            ]))
+
             work_dir = tempfile.mkdtemp(dir=WORK_DIR)
             try:
-                log.info(f"[transcript] Extracting subtitles for {video_url} (lang={lang})")
+                log.info(f"[transcript] Extracting subtitles for {video_url} (langs={lang_list})")
+
+                cookies_path = _write_cookies_file(cookies_text, work_dir) if cookies_text else None
+                cookie_args = ["--cookies", cookies_path] if cookies_path else []
 
                 # Use yt-dlp to extract subtitles without downloading video
                 out_template = os.path.join(work_dir, "subs")
@@ -898,9 +954,10 @@ class Handler(BaseHTTPRequestHandler):
                     "--skip-download",
                     "--write-auto-sub",
                     "--write-sub",
-                    "--sub-lang", lang,
+                    "--sub-lang", lang_list,
                     "--sub-format", "json3",
                     "--output", out_template,
+                    *cookie_args,
                     video_url,
                 ]
                 stdout, stderr, rc = run_cmd(cmd, timeout=120, cwd=work_dir)
@@ -913,8 +970,21 @@ class Handler(BaseHTTPRequestHandler):
                     })
                     return
 
+                def _pick_sub_file(ext):
+                    """Prefer the requested language, then original, then en."""
+                    files = list(Path(work_dir).glob(f"subs*.{ext}"))
+                    if not files:
+                        return []
+                    def rank(f):
+                        name = f.name
+                        for i, code in enumerate(lang_list.split(",")):
+                            if f".{code}." in name:
+                                return i
+                        return 99
+                    return sorted(files, key=rank)
+
                 # Find the subtitle file (json3 format)
-                sub_files = list(Path(work_dir).glob("subs*.json3"))
+                sub_files = _pick_sub_file("json3")
                 if not sub_files:
                     # Try VTT fallback
                     cmd2 = [
@@ -922,13 +992,14 @@ class Handler(BaseHTTPRequestHandler):
                         "--skip-download",
                         "--write-auto-sub",
                         "--write-sub",
-                        "--sub-lang", lang,
+                        "--sub-lang", lang_list,
                         "--sub-format", "vtt",
                         "--output", out_template,
+                        *cookie_args,
                         video_url,
                     ]
                     stdout2, stderr2, rc2 = run_cmd(cmd2, timeout=120, cwd=work_dir)
-                    sub_files = list(Path(work_dir).glob("subs*.vtt"))
+                    sub_files = _pick_sub_file("vtt")
 
                 if not sub_files:
                     log.warning(f"[transcript] No subtitle files found")
