@@ -42,6 +42,31 @@ import {
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 
+/**
+ * Hosts the Convex /api/video-proxy allowlists. Previously only
+ * googlevideo.com URLs were routed through the proxy — Piped/VPS URLs
+ * were fetched directly by the browser, where missing CORS headers or a
+ * slow instance made the download hang at 0% forever.
+ */
+function shouldProxy(rawUrl: string): boolean {
+  try {
+    const h = new URL(rawUrl).hostname;
+    return (
+      h.endsWith(".googlevideo.com") ||
+      h.endsWith(".youtube.com") ||
+      h.endsWith(".ytimg.com") ||
+      h === "piped.private.coffee" ||
+      h.endsWith(".piped.private.coffee") ||
+      h.endsWith(".kavin.rocks") ||
+      h.endsWith(".r4fo.com") ||
+      h.endsWith(".adminforge.de") ||
+      h === "76.13.133.153"
+    );
+  } catch {
+    return false;
+  }
+}
+
 function formatSeconds(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -265,12 +290,12 @@ export function JobDetailPage() {
         return;
       }
 
-      // Route through CORS proxy (YouTube CDN doesn't allow browser fetch)
+      // Route through CORS proxy (YouTube CDN / Piped don't allow browser fetch)
       const convexSiteUrl = import.meta.env.VITE_CONVEX_SITE_URL;
-      if (convexSiteUrl && videoUrl.includes("googlevideo.com")) {
+      if (convexSiteUrl && videoUrl && shouldProxy(videoUrl)) {
         videoUrl = `${convexSiteUrl}/api/video-proxy?url=${encodeURIComponent(videoUrl)}`;
       }
-      if (convexSiteUrl && audioUrl?.includes("googlevideo.com")) {
+      if (convexSiteUrl && audioUrl && shouldProxy(audioUrl)) {
         audioUrl = `${convexSiteUrl}/api/video-proxy?url=${encodeURIComponent(audioUrl)}`;
       }
 

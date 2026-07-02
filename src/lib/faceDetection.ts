@@ -109,11 +109,17 @@ export function disposeFaceDetector(): void {
 
 // ── Types ──────────────────────────────────────────────────────────────
 interface FaceInfo {
-  centerX: number; // pixels
+  centerX: number; // pixels (in canvas coordinates)
   centerY: number;
   width: number;
   height: number;
   score: number; // confidence 0..1
+  /** Exact dimensions of the canvas this face was detected on. Needed to
+   *  normalize positions correctly — the old code ESTIMATED canvas size
+   *  from max face extents, which skewed dual-mode crop positions whenever
+   *  faces didn't span the full frame. */
+  canvasW: number;
+  canvasH: number;
 }
 
 export interface TrackingKeyframe {
@@ -284,6 +290,8 @@ async function detectFacesInCanvas(
         width: bb.width,
         height: bb.height,
         score,
+        canvasW: cw,
+        canvasH: ch,
       });
     }
     return out;
@@ -735,16 +743,23 @@ export async function planClipCropFromFrames(
     if (dv > maxPanNormPerStep) nextX = cx + maxPanNormPerStep;
     else if (dv < -maxPanNormPerStep) nextX = cx - maxPanNormPerStep;
 
-    // RE-ANCHORING: if camera has been static for ≥3s and the face is
-    // within the deadzone, snap to face. This eliminates drift that
-    // accumulates from EMA half-steps inside the deadzone.
+    // RE-ANCHORING: if camera has been static for ≥3s and the face sits
+    // off-center inside the deadzone, glide toward it. The previous code
+    // snapped instantly (nextX = head) — a visible jump of up to a full
+    // deadzone width (~73px on a 608px crop) every 3 seconds. Now we move
+    // with the same EMA + velocity cap as normal panning, and only reset
+    // the timer once we've arrived, so the glide continues across frames.
     if (
       !movedThisStep &&
       lastMovedIdx >= 0 &&
       i - lastMovedIdx >= reanchorEveryFrames
     ) {
-      nextX = head;
-      lastMovedIdx = i; // reset the timer
+      let re = alpha * head + (1 - alpha) * cx;
+      const rdv = re - cx;
+      if (rdv > maxPanNormPerStep) re = cx + maxPanNormPerStep;
+      else if (rdv < -maxPanNormPerStep) re = cx - maxPanNormPerStep;
+      nextX = re;
+      if (Math.abs(head - nextX) < 0.005) lastMovedIdx = i; // arrived
     } else if (movedThisStep) {
       lastMovedIdx = i;
     }
@@ -814,7 +829,11 @@ export async function planClipCropFromFrames(
     for (let i = runStart; i <= endIdx; i++) {
       const v = cropPositions[i];
       if (v !== null) {
-        const sampleAbsT = (i + 0.5) * dt;
+        // ffmpeg's `fps=N` filter emits frame i at t≈i/N (first frame at
+        // t=0), while the legacy <video> extractor sampled mid-interval at
+        // (i+0.5)/N. Using the wrong convention shifted every keyframe by
+        // half a sample (0.125s @ 4fps), making tracked pans lag the face.
+        const sampleAbsT = useExtractor ? (i + 0.5) * dt : i * dt;
         const segRelT = Math.max(0, sampleAbsT - t0);
         kfs.push({ t: segRelT, x: v });
       }
@@ -991,23 +1010,6 @@ function decideDual(
   const SIZE_RATIO_MAX = 2.0;
   const CONSISTENCY_THRESHOLD = 0.85;
 
-  // Estimate canvas dimensions from the max face bbox extents across the clip
-  // (face boxes approach but don't exceed canvas borders). All FaceInfo
-  // coordinates use the same canvas, so a single estimate suffices.
-  let estCanvasW = 0;
-  let estCanvasH = 0;
-  for (const faces of framesFaces) {
-    for (const f of faces) {
-      const r = f.centerX + f.width / 2;
-      const b = f.centerY + f.height / 2;
-      if (r > estCanvasW) estCanvasW = r;
-      if (b > estCanvasH) estCanvasH = b;
-    }
-  }
-  // Add 5% safety margin — faces don't reach the very edge of frame
-  estCanvasW = Math.max(estCanvasW * 1.05, 1);
-  estCanvasH = Math.max(estCanvasH * 1.05, 1);
-
   let framesWithAny = 0;
   let framesWithDual = 0;
   const validLeftsNorm: number[] = [];
@@ -1017,19 +1019,22 @@ function decideDual(
     if (faces.length === 0) continue;
     framesWithAny++;
     if (faces.length < 2) continue;
-    // Filter tiny detections (canvas-relative width < 3%)
+    // Filter tiny detections (canvas-relative width < 3%). Uses the EXACT
+    // canvas dims stored on each detection — the previous estimate from
+    // max face extents shifted every normalized coordinate whenever faces
+    // sat away from the frame edges, misplacing the dual crop windows.
     const big = faces.filter(
-      f => f.width / estCanvasW > 0.03 && f.height / estCanvasH > 0.03,
+      f => f.width / f.canvasW > 0.03 && f.height / f.canvasH > 0.03,
     );
     if (big.length < 2) continue;
     const sorted = [...big].sort((a, b) => a.centerX - b.centerX);
     const left = sorted[0];
     const right = sorted[sorted.length - 1];
     // Horizontal separation constraint
-    const sepNorm = (right.centerX - left.centerX) / estCanvasW;
+    const sepNorm = (right.centerX - left.centerX) / left.canvasW;
     if (sepNorm < minSepNorm) continue;
     // Y position constraint (kills comedian+audience)
-    const dyNorm = Math.abs(left.centerY - right.centerY) / estCanvasH;
+    const dyNorm = Math.abs(left.centerY - right.centerY) / left.canvasH;
     if (dyNorm > Y_TOLERANCE) continue;
     // Size constraint
     const aL = left.width * left.height;
@@ -1038,8 +1043,8 @@ function decideDual(
     const sizeRatio = Math.max(aL, aR) / Math.min(aL, aR);
     if (sizeRatio > SIZE_RATIO_MAX) continue;
     framesWithDual++;
-    validLeftsNorm.push(left.centerX / estCanvasW);
-    validRightsNorm.push(right.centerX / estCanvasW);
+    validLeftsNorm.push(left.centerX / left.canvasW);
+    validRightsNorm.push(right.centerX / right.canvasW);
   }
 
   if (framesWithAny === 0) return null;
@@ -1140,22 +1145,11 @@ function decideDualByBimodality(
   const TOLERANCE = 0.05;
   const cluster1Faces: FaceInfo[] = [];
   const cluster2Faces: FaceInfo[] = [];
-  // Estimate canvas dims to normalize face coords (same approach as Pass 2)
-  let estCanvasW = 0;
-  let estCanvasH = 0;
+  // Uses the EXACT canvas dims stored on each detection (see FaceInfo) —
+  // the old max-extent estimation skewed cluster matching and Y/size stats.
   for (const faces of allFacesPerFrame) {
     for (const f of faces) {
-      const r = f.centerX + f.width / 2;
-      const b = f.centerY + f.height / 2;
-      if (r > estCanvasW) estCanvasW = r;
-      if (b > estCanvasH) estCanvasH = b;
-    }
-  }
-  estCanvasW = Math.max(estCanvasW * 1.05, 1);
-  estCanvasH = Math.max(estCanvasH * 1.05, 1);
-  for (const faces of allFacesPerFrame) {
-    for (const f of faces) {
-      const xNorm = f.centerX / estCanvasW;
+      const xNorm = f.centerX / f.canvasW;
       if (Math.abs(xNorm - c1) < TOLERANCE) cluster1Faces.push(f);
       else if (Math.abs(xNorm - c2) < TOLERANCE) cluster2Faces.push(f);
     }
@@ -1163,16 +1157,16 @@ function decideDualByBimodality(
   if (cluster1Faces.length < 2 || cluster2Faces.length < 2) return null;
 
   // Y similarity check
-  const medY1 = median(cluster1Faces.map(f => f.centerY / estCanvasH));
-  const medY2 = median(cluster2Faces.map(f => f.centerY / estCanvasH));
+  const medY1 = median(cluster1Faces.map(f => f.centerY / f.canvasH));
+  const medY2 = median(cluster2Faces.map(f => f.centerY / f.canvasH));
   if (Math.abs(medY1 - medY2) > 0.25) return null;
 
   // Size similarity check
   const medA1 = median(
-    cluster1Faces.map(f => (f.width * f.height) / (estCanvasW * estCanvasH)),
+    cluster1Faces.map(f => (f.width * f.height) / (f.canvasW * f.canvasH)),
   );
   const medA2 = median(
-    cluster2Faces.map(f => (f.width * f.height) / (estCanvasW * estCanvasH)),
+    cluster2Faces.map(f => (f.width * f.height) / (f.canvasW * f.canvasH)),
   );
   if (medA1 <= 0 || medA2 <= 0) return null;
   const sizeRatio = Math.max(medA1, medA2) / Math.min(medA1, medA2);

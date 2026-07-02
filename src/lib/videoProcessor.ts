@@ -65,20 +65,118 @@ async function getFFmpeg(_onProgress?: ProgressCallback): Promise<FFmpeg> {
   return ffmpeg;
 }
 
-// ── Chunked download (unchanged from v1) ───────────────────────────────
+// ── Download helpers ───────────────────────────────────────────────────
 
+const PROBE_TIMEOUT_MS = 10_000;
+const CHUNK_TIMEOUT_MS = 60_000;
+const STALL_TIMEOUT_MS = 30_000;
+const DL_CHUNK_SIZE = 8 * 1024 * 1024;
 
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit,
+  timeoutMs: number,
+): Promise<Response> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Download a full file.
+ *
+ * Uses chunked HTTP Range requests (8 MB) whenever the server supports
+ * them. This matters for two reasons:
+ *   1. YouTube's CDN heavily throttles plain full-file GETs (to roughly
+ *      realtime playback speed) — which made downloads look stuck at 0%.
+ *      Ranged requests are served at full speed.
+ *   2. Each chunk has its own timeout + 3 retries, so one flaky request
+ *      can't hang the whole pipeline forever.
+ * Falls back to a streaming download (with a 30 s stall watchdog) when
+ * Range isn't supported.
+ */
 async function downloadVideo(
   url: string,
   onProgress?: (percent: number) => void,
 ): Promise<Uint8Array> {
-  // Simple streaming download — accumulate chunks, concat at end.
-  // Avoids redundant fetches & large pre-allocations.
-  const resp = await fetch(url);
+  // Probe size + Range support (bounded by a timeout so a dead proxy
+  // can't hang us here either)
+  let totalSize = 0;
+  let rangeOk = false;
+  try {
+    const probe = await fetchWithTimeout(
+      url,
+      { headers: { Range: "bytes=0-0" } },
+      PROBE_TIMEOUT_MS,
+    );
+    if (probe.status === 206) {
+      rangeOk = true;
+      const m = probe.headers.get("Content-Range")?.match(/\/(\d+)/);
+      if (m) totalSize = Number(m[1]);
+    } else {
+      const cl = probe.headers.get("Content-Length");
+      if (cl) totalSize = Number(cl);
+    }
+    probe.body?.cancel().catch(() => {});
+  } catch (e) {
+    console.warn("[download] Probe failed, falling back to streaming:", e);
+  }
+
+  if (rangeOk && totalSize > 0) {
+    console.log(
+      `[download] Chunked Range download: ${(totalSize / 1024 / 1024).toFixed(1)}MB`,
+    );
+    const out = new Uint8Array(totalSize);
+    let received = 0;
+    while (received < totalSize) {
+      const end = Math.min(received + DL_CHUNK_SIZE - 1, totalSize - 1);
+      let attempt = 0;
+      for (;;) {
+        try {
+          const resp = await fetchWithTimeout(
+            url,
+            { headers: { Range: `bytes=${received}-${end}` } },
+            CHUNK_TIMEOUT_MS,
+          );
+          if (resp.status === 403 || resp.status === 404 || resp.status === 410) {
+            // URL expired — retrying won't help
+            throw new Error(`URL expirat (HTTP ${resp.status}) — reîmprospătează URL-ul`);
+          }
+          if (!resp.ok && resp.status !== 206) {
+            throw new Error(`HTTP ${resp.status}`);
+          }
+          const buf = new Uint8Array(await resp.arrayBuffer());
+          out.set(buf, received);
+          received += buf.byteLength;
+          break;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (msg.includes("URL expirat") || ++attempt >= 3) {
+            throw new Error(
+              `Descărcarea a eșuat la ${(received / 1e6).toFixed(1)}MB: ${msg}`,
+            );
+          }
+          console.warn(`[download] Chunk retry ${attempt}/3:`, msg);
+          await new Promise(r => setTimeout(r, 1000 * attempt));
+        }
+      }
+      onProgress?.(Math.round((received / totalSize) * 100));
+    }
+    console.log(`[download] Complete: ${(received / 1024 / 1024).toFixed(1)}MB`);
+    return out;
+  }
+
+  // ── Streaming fallback (no Range support) with stall watchdog ────
+  const ctrl = new AbortController();
+  const resp = await fetch(url, { signal: ctrl.signal });
   if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
-  const totalSize = Number(resp.headers.get("content-length") || 0);
+  const streamTotal = Number(resp.headers.get("content-length") || 0) || totalSize;
   console.log(
-    `[download] Starting: ${totalSize ? `${(totalSize / 1024 / 1024).toFixed(1)}MB` : "unknown size"}`,
+    `[download] Streaming: ${streamTotal ? `${(streamTotal / 1024 / 1024).toFixed(1)}MB` : "unknown size"}`,
   );
 
   const reader = resp.body?.getReader();
@@ -87,16 +185,28 @@ async function downloadVideo(
   const chunks: Uint8Array[] = [];
   let received = 0;
   while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    received += value.length;
-    if (onProgress && totalSize > 0) {
-      onProgress(Math.round((received / totalSize) * 100));
+    // Abort if no bytes arrive for STALL_TIMEOUT_MS — a silent hang is
+    // worse than a clear error the user can act on.
+    const stallTimer = setTimeout(() => ctrl.abort(), STALL_TIMEOUT_MS);
+    let step: ReadableStreamReadResult<Uint8Array>;
+    try {
+      step = await reader.read();
+    } catch (e) {
+      clearTimeout(stallTimer);
+      throw new Error(
+        `Descărcarea s-a blocat la ${(received / 1e6).toFixed(1)}MB (fără date 30s). ` +
+          `Reîmprospătează URL-ul și încearcă din nou.`,
+      );
+    }
+    clearTimeout(stallTimer);
+    if (step.done) break;
+    chunks.push(step.value);
+    received += step.value.length;
+    if (onProgress && streamTotal > 0) {
+      onProgress(Math.round((received / streamTotal) * 100));
     }
   }
 
-  // Concat all chunks into a single Uint8Array
   const result = new Uint8Array(received);
   let offset = 0;
   for (const chunk of chunks) {
@@ -374,17 +484,15 @@ async function detectSilenceInClip(
   };
   ffmpeg.on("log", handler);
 
-  const fastSeek = Math.max(0, clipStart - 0.5);
-  const innerSeek = clipStart - fastSeek;
-
+  // Single input -ss: rebases timestamps so silencedetect logs are
+  // clip-relative (the old two-stage seek offset every interval by +0.5s,
+  // which shifted all silence-removal cut points onto spoken words).
   try {
     await ffmpeg.exec([
       "-ss",
-      formatTime(fastSeek),
+      formatTime(clipStart),
       "-i",
       "source.mp4",
-      "-ss",
-      formatTime(innerSeek),
       "-t",
       clipDuration.toFixed(3),
       "-af",
@@ -396,6 +504,10 @@ async function detectSilenceInClip(
     ]);
   } catch {
     return [];
+  } finally {
+    // Without this, a new log handler leaked on EVERY clip — logLines from
+    // old clips kept growing and every ffmpeg.exec got slower.
+    ffmpeg.off("log", handler);
   }
 
   const silences: SilenceInterval[] = [];
@@ -816,20 +928,20 @@ async function processClip(
     await ffmpeg.writeFile("subs.ass", encoder.encode(assContent));
   }
 
-  // -ss BEFORE -i is fast-seek (keyframe-aligned, can be off by 1-2s).
-  // For frame-accurate start we want -ss AFTER -i, at the cost of decoding
-  // from the previous keyframe. We compromise: fast-seek close (-ss before
-  // -i to 0.5s before target), then precise-seek inside (-ss after -i).
-  const fastSeek = Math.max(0, clip.startTime - 0.5);
-  const innerSeek = clip.startTime - fastSeek;
-
+  // Single INPUT -ss. When transcoding (not stream-copying), ffmpeg input
+  // seeking IS frame-accurate: the demuxer seeks to the previous keyframe,
+  // then decodes and discards frames up to the exact target. Crucially it
+  // also rebases timestamps so filters see t=0 exactly at the clip start.
+  //
+  // The previous two-stage seek (-ss 0.5s before -i, then -ss 0.5s after)
+  // left every filter timestamp offset by +0.5s: tracking crop expressions
+  // panned half a second early, multi-segment trim windows cut in the
+  // wrong place, and ASS subtitles ran 0.5s ahead of the audio.
   const args: string[] = [
     "-ss",
-    formatTime(fastSeek),
+    formatTime(clip.startTime),
     "-i",
     "source.mp4",
-    "-ss",
-    formatTime(innerSeek),
     "-t",
     String(duration.toFixed(3)),
   ];
@@ -1154,7 +1266,11 @@ async function processAllClipsSegmented(
       });
 
       const clipDuration = clip.endTime - clip.startTime;
-      ffmpeg.on("progress", ({ time }) => {
+      // Named handler + off() in finally: previously a NEW anonymous
+      // handler was added per clip and never removed, so stale handlers
+      // from earlier clips kept firing with wrong indices (progress bar
+      // jumping around) and accumulated forever.
+      const progressHandler = ({ time }: { progress: number; time: number }) => {
         const cp = Math.min(
           100,
           Math.round((time / 1_000_000 / clipDuration) * 100),
@@ -1168,9 +1284,14 @@ async function processAllClipsSegmented(
           ),
           message: `Se encodează Short ${n}/${clips.length}... ${cp}%`,
         });
-      });
-
-      const outputData = await processClip(ffmpeg, clip, vW, vH);
+      };
+      ffmpeg.on("progress", progressHandler);
+      let outputData: Uint8Array;
+      try {
+        outputData = await processClip(ffmpeg, clip, vW, vH);
+      } finally {
+        ffmpeg.off("progress", progressHandler);
+      }
       results.set(
         clip.index,
         new Blob([outputData.buffer as ArrayBuffer], {
@@ -1504,7 +1625,7 @@ export async function processAllClips(
 
     try {
       const clipDuration = clip.endTime - clip.startTime;
-      ffmpeg.on("progress", ({ time }) => {
+      const progressHandler = ({ time }: { progress: number; time: number }) => {
         const clipPercent = Math.min(
           100,
           Math.round((time / 1_000_000 / clipDuration) * 100),
@@ -1516,14 +1637,19 @@ export async function processAllClips(
           percent: Math.round(((i + clipPercent / 100) / clips.length) * 100),
           message: `Se encodează Short ${i + 1}/${clips.length}... ${clipPercent}%`,
         });
-      });
-
-      const outputData = await processClip(
-        ffmpeg,
-        clip,
-        videoWidth,
-        videoHeight,
-      );
+      };
+      ffmpeg.on("progress", progressHandler);
+      let outputData: Uint8Array;
+      try {
+        outputData = await processClip(
+          ffmpeg,
+          clip,
+          videoWidth,
+          videoHeight,
+        );
+      } finally {
+        ffmpeg.off("progress", progressHandler);
+      }
       const blob = new Blob([outputData.buffer as ArrayBuffer], {
         type: "video/mp4",
       });

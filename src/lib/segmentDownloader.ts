@@ -27,18 +27,42 @@ const BITRATE_SAFETY = 1.5; // over-estimate byte range for safety
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+const RANGE_TIMEOUT_MS = 60_000;
+const RANGE_RETRIES = 3;
+
 async function fetchRange(
   url: string,
   start: number,
   end: number,
 ): Promise<ArrayBuffer> {
-  const resp = await fetch(url, {
-    headers: { Range: `bytes=${start}-${end}` },
-  });
-  if (!resp.ok && resp.status !== 206) {
-    throw new Error(`Range fetch failed: HTTP ${resp.status}`);
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < RANGE_RETRIES; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), RANGE_TIMEOUT_MS);
+    try {
+      const resp = await fetch(url, {
+        headers: { Range: `bytes=${start}-${end}` },
+        signal: ctrl.signal,
+      });
+      if (resp.status === 403 || resp.status === 404 || resp.status === 410) {
+        // Expired/blocked URL — retrying won't help
+        throw new Error(`Range fetch failed: HTTP ${resp.status} (URL expirat?)`);
+      }
+      if (!resp.ok && resp.status !== 206) {
+        throw new Error(`Range fetch failed: HTTP ${resp.status}`);
+      }
+      return await resp.arrayBuffer();
+    } catch (e) {
+      lastErr = e;
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("URL expirat")) break;
+      console.warn(`[segDL] Range retry ${attempt + 1}/${RANGE_RETRIES}:`, msg);
+      await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+    } finally {
+      clearTimeout(timer);
+    }
   }
-  return resp.arrayBuffer();
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
 function asMP4Buf(ab: ArrayBuffer, fileStart: number): MP4BoxBuffer {
@@ -63,7 +87,14 @@ export interface SegmentResult {
  */
 export async function supportsRangeRequests(url: string): Promise<boolean> {
   try {
-    const resp = await fetch(url, { headers: { Range: "bytes=0-0" } });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10_000);
+    const resp = await fetch(url, {
+      headers: { Range: "bytes=0-0" },
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    resp.body?.cancel().catch(() => {});
     return resp.status === 206;
   } catch {
     return false;
@@ -75,7 +106,14 @@ export async function supportsRangeRequests(url: string): Promise<boolean> {
  */
 export async function getFileSize(url: string): Promise<number> {
   try {
-    const resp = await fetch(url, { headers: { Range: "bytes=0-0" } });
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10_000);
+    const resp = await fetch(url, {
+      headers: { Range: "bytes=0-0" },
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    resp.body?.cancel().catch(() => {});
     if (resp.status === 206) {
       const m = resp.headers.get("Content-Range")?.match(/\/(\d+)/);
       if (m) return Number(m[1]);
