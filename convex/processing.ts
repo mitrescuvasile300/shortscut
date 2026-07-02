@@ -985,8 +985,18 @@ function parseTTML(ttml: string): {
     }
   }
 
-  const text = deduped.map(s => s.text).join(" ");
-  return { segments: deduped, text };
+  // Include timestamps so the AI can reference exact positions
+  const lines = deduped.map(seg => {
+    const h = Math.floor(seg.start / 3600);
+    const m = Math.floor((seg.start % 3600) / 60);
+    const ss = Math.floor(seg.start % 60);
+    const ts =
+      h > 0
+        ? `[${h}:${m.toString().padStart(2, "0")}:${ss.toString().padStart(2, "0")}]`
+        : `[${m.toString().padStart(2, "0")}:${ss.toString().padStart(2, "0")}]`;
+    return `${ts} ${seg.text}`;
+  });
+  return { segments: deduped, text: lines.join("\n") };
 }
 
 // Internal mutation to update job status
@@ -1223,9 +1233,16 @@ Find up to ${n} potential viral short clips (${minDuration}-${maxDuration}s) in 
     intelligence_level: "smart",
   });
 
-  if (result.error || !result.result) return [];
+  console.log(`[scanChunk ${chunkIndex + 1}/${totalChunks}] callTool returned: error=${result.error}, hasResult=${!!result.result}`);
+  if (result.error || !result.result) {
+    console.log(`[scanChunk ${chunkIndex + 1}/${totalChunks}] Skipping chunk — error: ${result.error}`);
+    return [];
+  }
   const data = result.result;
-  if (String(data["noGoodMoments"]) === "true") return [];
+  if (String(data["noGoodMoments"]) === "true") {
+    console.log(`[scanChunk ${chunkIndex + 1}/${totalChunks}] AI says no good moments in this chunk`);
+    return [];
+  }
 
   const candidates: CandidateClip[] = [];
   for (let i = 1; i <= n; i++) {
@@ -1520,8 +1537,10 @@ async function analyzeTranscriptWithAI(
   const targetLang = langMap[language] || language;
 
   const chunks = splitTranscript(transcript);
+  console.log(`[analyzeTranscript] Transcript length: ${transcript.length} chars, split into ${chunks.length} chunks`);
   const allCandidates: CandidateClip[] = [];
   for (let i = 0; i < chunks.length; i++) {
+    console.log(`[analyzeTranscript] Scanning chunk ${i + 1}/${chunks.length} (${chunks[i].length} chars)...`);
     const candidates = await scanChunkForCandidates(
       chunks[i],
       i,
@@ -1532,8 +1551,10 @@ async function analyzeTranscriptWithAI(
       minDuration,
       maxDuration,
     );
+    console.log(`[analyzeTranscript] Chunk ${i + 1}: found ${candidates.length} candidates`);
     allCandidates.push(...candidates);
   }
+  console.log(`[analyzeTranscript] Total candidates: ${allCandidates.length}`);
   if (allCandidates.length === 0) return [];
 
   // Correct timestamps before dedup
@@ -1720,17 +1741,27 @@ export const processJob = action({
           if (vpsTranscriptResp.ok) {
             const vpsData = await vpsTranscriptResp.json();
             if (vpsData.success && vpsData.segments?.length > 0) {
+              const vpsSegs = vpsData.segments.map(
+                (s: { start: number; end: number; text: string }) => ({
+                  start: s.start,
+                  end: s.end,
+                  text: s.text,
+                }),
+              );
+              // Include timestamps so the AI can reference exact positions
+              const vpsLines = vpsSegs.map((seg: { start: number; text: string }) => {
+                const h = Math.floor(seg.start / 3600);
+                const m = Math.floor((seg.start % 3600) / 60);
+                const s = Math.floor(seg.start % 60);
+                const ts =
+                  h > 0
+                    ? `[${h}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}]`
+                    : `[${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}]`;
+                return `${ts} ${seg.text}`;
+              });
               transcriptResult = {
-                segments: vpsData.segments.map(
-                  (s: { start: number; end: number; text: string }) => ({
-                    start: s.start,
-                    end: s.end,
-                    text: s.text,
-                  }),
-                ),
-                text: vpsData.segments
-                  .map((s: { text: string }) => s.text)
-                  .join(" "),
+                segments: vpsSegs,
+                text: vpsLines.join("\n"),
               };
               console.log(
                 `[processJob] VPS transcript OK: ${transcriptResult.segments.length} segments`,
@@ -1854,6 +1885,7 @@ export const processJob = action({
       });
 
       // ===== STEP 3: AI analysis =====
+      console.log(`[processJob] Transcript obtained: ${transcriptResult.text.length} chars, ${transcriptResult.segments.length} segments. Starting AI analysis...`);
       const videoAuthor = piped ? piped.title.split(" - ")[0] : "Unknown";
       const clips = await analyzeTranscriptWithAI(
         transcriptResult.text,
