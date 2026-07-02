@@ -140,7 +140,7 @@ http.route({
         const allClips = await ctx.runQuery(internal.processing.getClipsInternal, {
           jobId: jobId as Id<"jobs">,
         });
-        clips = allClips.map((c) => ({
+        clips = allClips.map((c: { title: string; startTime: number; endTime: number; viralScore: number; transcriptExcerpt: string; hookLine?: string; caption?: string }) => ({
           title: c.title,
           startTime: c.startTime,
           endTime: c.endTime,

@@ -327,17 +327,17 @@ export const startVpsFetch = action({
     fetchId: v.union(v.string(), v.null()),
     error: v.optional(v.string()),
   }),
-  handler: async (ctx, { jobId }) => {
+  handler: async (ctx, { jobId }): Promise<{ fetchId: string | null; error?: string }> => {
     const userId = await getAuthUserId(ctx);
     if (!userId) throw new Error("Not authenticated");
 
-    const job = await ctx.runQuery(internal.processing.getJobInternal, {
+    const job: { videoUrl: string } | null = await ctx.runQuery(internal.processing.getJobInternal, {
       jobId,
     });
     if (!job) throw new Error("Job not found");
 
     try {
-      const resp = await fetch(`${VPS_URL}/fetch`, {
+      const resp: Response = await fetch(`${VPS_URL}/fetch`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -375,12 +375,12 @@ export const getVpsFetchStatus = action({
     height: v.optional(v.number()),
     error: v.optional(v.string()),
   }),
-  handler: async (ctx, { fetchId }) => {
+  handler: async (ctx, { fetchId }): Promise<{ status: string; fileUrl: string | null; size?: number; width?: number; height?: number; error?: string }> => {
     const userId = await getAuthUserId(ctx);
     if (!userId) throw new Error("Not authenticated");
 
     try {
-      const resp = await fetch(
+      const resp: Response = await fetch(
         `${VPS_URL}/fetch-status?id=${encodeURIComponent(fetchId)}`,
       );
       const data = (await resp.json()) as {
