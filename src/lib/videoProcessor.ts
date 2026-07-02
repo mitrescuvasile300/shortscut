@@ -74,8 +74,19 @@ async function downloadVideo(
 ): Promise<Uint8Array> {
   // Simple streaming download — accumulate chunks, concat at end.
   // Avoids redundant fetches & large pre-allocations.
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5 * 60 * 1000); // 5 min timeout
+  let resp: Response;
+  try {
+    resp = await fetch(url, { signal: controller.signal });
+  } catch (e) {
+    clearTimeout(timeout);
+    throw new Error(`Download failed: ${e instanceof Error ? e.message : "network error"}`);
+  }
+  if (!resp.ok) {
+    clearTimeout(timeout);
+    throw new Error(`Download failed: ${resp.status}`);
+  }
   const totalSize = Number(resp.headers.get("content-length") || 0);
   console.log(
     `[download] Starting: ${totalSize ? `${(totalSize / 1024 / 1024).toFixed(1)}MB` : "unknown size"}`,
@@ -103,6 +114,7 @@ async function downloadVideo(
     result.set(chunk, offset);
     offset += chunk.length;
   }
+  clearTimeout(timeout);
   console.log(`[download] Complete: ${(received / 1024 / 1024).toFixed(1)}MB`);
   return result;
 }

@@ -265,13 +265,14 @@ export function JobDetailPage() {
         return;
       }
 
-      // Route through CORS proxy (YouTube CDN doesn't allow browser fetch)
-      const convexSiteUrl = import.meta.env.VITE_CONVEX_SITE_URL;
-      if (convexSiteUrl && videoUrl.includes("googlevideo.com")) {
-        videoUrl = `${convexSiteUrl}/api/video-proxy?url=${encodeURIComponent(videoUrl)}`;
+      // Route through VPS CORS proxy (YouTube CDN doesn't allow browser fetch)
+      // VPS has no size limits unlike Convex httpAction (20MB cap)
+      const VPS_PROXY = "http://76.13.133.153:3458/proxy";
+      if (videoUrl.includes("googlevideo.com")) {
+        videoUrl = `${VPS_PROXY}?url=${encodeURIComponent(videoUrl)}`;
       }
-      if (convexSiteUrl && audioUrl?.includes("googlevideo.com")) {
-        audioUrl = `${convexSiteUrl}/api/video-proxy?url=${encodeURIComponent(audioUrl)}`;
+      if (audioUrl?.includes("googlevideo.com")) {
+        audioUrl = `${VPS_PROXY}?url=${encodeURIComponent(audioUrl)}`;
       }
 
       // Get transcript segments for subtitles
