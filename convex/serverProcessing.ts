@@ -312,3 +312,99 @@ export const processJobOnServer = action({
     return null;
   },
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// VPS source-video fetch — lets the BROWSER pipeline source the video
+// from the VPS when direct YouTube/Piped downloads hang or fail.
+// The VPS downloads with yt-dlp (reliable) and serves the file back
+// with HTTP Range support at /file/<id>; the browser reads it through
+// the Convex video-proxy (the VPS is plain http → mixed content).
+// ═══════════════════════════════════════════════════════════════════
+
+export const startVpsFetch = action({
+  args: { jobId: v.id("jobs") },
+  returns: v.object({
+    fetchId: v.union(v.string(), v.null()),
+    error: v.optional(v.string()),
+  }),
+  handler: async (ctx, { jobId }) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new Error("Not authenticated");
+
+    const job = await ctx.runQuery(internal.processing.getJobInternal, {
+      jobId,
+    });
+    if (!job) throw new Error("Job not found");
+
+    try {
+      const resp = await fetch(`${VPS_URL}/fetch`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": VPS_API_KEY,
+        },
+        body: JSON.stringify({ video_url: job.videoUrl }),
+      });
+      const data = (await resp.json()) as {
+        fetch_id?: string;
+        error?: string;
+      };
+      if (!resp.ok || !data.fetch_id) {
+        return {
+          fetchId: null,
+          error: data.error || `VPS /fetch HTTP ${resp.status}`,
+        };
+      }
+      return { fetchId: data.fetch_id };
+    } catch (e) {
+      return {
+        fetchId: null,
+        error: e instanceof Error ? e.message : "VPS unreachable",
+      };
+    }
+  },
+});
+
+export const getVpsFetchStatus = action({
+  args: { fetchId: v.string() },
+  returns: v.object({
+    status: v.string(),
+    fileUrl: v.union(v.string(), v.null()),
+    size: v.optional(v.number()),
+    width: v.optional(v.number()),
+    height: v.optional(v.number()),
+    error: v.optional(v.string()),
+  }),
+  handler: async (ctx, { fetchId }) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new Error("Not authenticated");
+
+    try {
+      const resp = await fetch(
+        `${VPS_URL}/fetch-status?id=${encodeURIComponent(fetchId)}`,
+      );
+      const data = (await resp.json()) as {
+        status?: string;
+        size?: number;
+        width?: number;
+        height?: number;
+        error?: string;
+      };
+      const status = data.status || "error";
+      return {
+        status,
+        fileUrl: status === "ready" ? `${VPS_URL}/file/${fetchId}` : null,
+        size: data.size ?? undefined,
+        width: data.width ?? undefined,
+        height: data.height ?? undefined,
+        error: data.error ?? undefined,
+      };
+    } catch (e) {
+      return {
+        status: "error",
+        fileUrl: null,
+        error: e instanceof Error ? e.message : "VPS unreachable",
+      };
+    }
+  },
+});

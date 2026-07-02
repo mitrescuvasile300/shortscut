@@ -38,6 +38,74 @@ log = logging.getLogger("shortscut")
 processed_files: dict[str, dict] = {}  # file_id -> {path, created, size}
 processing_lock = threading.Semaphore(MAX_CONCURRENT)
 
+# ── Source-video fetch cache ──────────────────────────────────────────
+# The browser pipeline can ask the VPS to download the source video
+# (yt-dlp works reliably here) and then reads it back with HTTP Range
+# requests via /file/<id>. Entries live for FETCH_TTL seconds.
+fetch_jobs: dict[str, dict] = {}  # fetch_id -> {status, path, video_key, created, size, width, height, error}
+FETCH_TTL = 2 * 3600
+
+
+def _yt_video_key(url):
+    m = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", url or "")
+    return m.group(1) if m else (url or "")
+
+
+def cleanup_old_fetches():
+    now = time.time()
+    for fid in [f for f, i in list(fetch_jobs.items()) if now - i["created"] > FETCH_TTL]:
+        info = fetch_jobs.pop(fid, None)
+        if info and info.get("path") and os.path.exists(info["path"]):
+            os.unlink(info["path"])
+            log.info(f"Cleaned up fetched source: {fid}")
+
+
+def _fetch_worker(fetch_id, video_url):
+    """Background download of a source video via yt-dlp (720p mp4 + m4a, merged)."""
+    info = fetch_jobs[fetch_id]
+    out_path = os.path.join(str(WORK_DIR), f"src_{fetch_id}.mp4")
+    try:
+        args = [
+            "yt-dlp",
+            "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
+            "--merge-output-format", "mp4",
+            "-o", out_path,
+            "--no-playlist",
+            video_url,
+        ]
+        _, stderr, rc = run_cmd(args, timeout=900)
+        if rc != 0 or not os.path.exists(out_path):
+            raise RuntimeError(f"yt-dlp failed (rc={rc}): {stderr[-400:]}")
+
+        # Probe dimensions
+        stdout, _, prc = run_cmd([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "json", out_path,
+        ], timeout=30)
+        width, height = 1280, 720
+        if prc == 0:
+            try:
+                streams = json.loads(stdout).get("streams", [])
+                if streams:
+                    width = streams[0].get("width", width)
+                    height = streams[0].get("height", height)
+            except json.JSONDecodeError:
+                pass
+
+        info.update({
+            "status": "ready",
+            "path": out_path,
+            "size": os.path.getsize(out_path),
+            "width": width,
+            "height": height,
+        })
+        log.info(f"[fetch {fetch_id}] ready: {info['size'] / 1e6:.1f} MB, {width}x{height}")
+    except Exception as e:
+        log.error(f"[fetch {fetch_id}] failed: {e}")
+        info.update({"status": "error", "error": str(e)})
+        if os.path.exists(out_path):
+            os.unlink(out_path)
+
 
 def cleanup_old_files(max_age_secs=1800):
     """Remove processed files older than max_age_secs."""
@@ -581,6 +649,80 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(200, {"status": "ok", "service": "shortscut-vps"})
             return
 
+        # Fetch-cache status (ids are unguessable UUIDs — no key needed)
+        if self.path.startswith("/fetch-status"):
+            from urllib.parse import parse_qs, urlparse
+            q = parse_qs(urlparse(self.path).query)
+            fid = (q.get("id") or [""])[0]
+            info = fetch_jobs.get(fid)
+            if not info:
+                self._json_response(404, {"status": "error", "error": "Unknown fetch id"})
+                return
+            self._json_response(200, {
+                "status": info["status"],
+                "size": info.get("size", 0),
+                "width": info.get("width"),
+                "height": info.get("height"),
+                "error": info.get("error"),
+            })
+            return
+
+        # Serve a fetched source video with full HTTP Range support so the
+        # browser's segment downloader can read only each clip's bytes.
+        if self.path.startswith("/file/"):
+            fid = self.path.split("/file/")[1].split("?")[0]
+            info = fetch_jobs.get(fid)
+            if not info or info.get("status") != "ready" or not os.path.exists(info.get("path", "")):
+                self._json_response(404, {"error": "File not found or not ready"})
+                return
+            path = info["path"]
+            size = os.path.getsize(path)
+            start, end = 0, size - 1
+            status = 200
+            range_header = self.headers.get("Range")
+            if range_header:
+                m = re.match(r"bytes=(\d*)-(\d*)", range_header)
+                if m and (m.group(1) or m.group(2)):
+                    if m.group(1):
+                        start = int(m.group(1))
+                        if m.group(2):
+                            end = min(int(m.group(2)), size - 1)
+                    else:
+                        start = max(0, size - int(m.group(2)))
+                    if start >= size or start > end:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        return
+                    status = 206
+            length = end - start + 1
+            self.send_response(status)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Accept-Ranges", "bytes")
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header(
+                "Access-Control-Expose-Headers",
+                "Content-Length, Content-Range, Accept-Ranges",
+            )
+            self.end_headers()
+            try:
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = f.read(min(256 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
         # Download processed file
         if self.path.startswith("/download/"):
             file_id = self.path.split("/download/")[1]
@@ -604,6 +746,45 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self._check_auth():
+            return
+
+        # Start a source-video fetch (browser pipeline reads it back via /file)
+        if self.path == "/fetch":
+            try:
+                body = json.loads(self._read_body())
+            except (json.JSONDecodeError, ValueError) as e:
+                self._json_response(400, {"error": f"Invalid JSON: {e}"})
+                return
+            video_url = body.get("video_url")
+            if not video_url:
+                self._json_response(400, {"error": "video_url required"})
+                return
+
+            cleanup_old_fetches()
+
+            # Dedupe: reuse an in-flight or ready fetch of the same video
+            key = _yt_video_key(video_url)
+            for fid, info in fetch_jobs.items():
+                if info.get("video_key") == key and info["status"] in ("downloading", "ready"):
+                    if info["status"] == "ready" and not os.path.exists(info.get("path", "")):
+                        continue
+                    log.info(f"[fetch] Reusing {info['status']} fetch {fid} for {key}")
+                    self._json_response(200, {"fetch_id": fid, "status": info["status"]})
+                    return
+
+            fetch_id = str(uuid.uuid4())
+            fetch_jobs[fetch_id] = {
+                "status": "downloading",
+                "path": None,
+                "video_key": key,
+                "created": time.time(),
+                "size": 0,
+            }
+            threading.Thread(
+                target=_fetch_worker, args=(fetch_id, video_url), daemon=True
+            ).start()
+            log.info(f"[fetch] Started {fetch_id} for {video_url}")
+            self._json_response(200, {"fetch_id": fetch_id, "status": "downloading"})
             return
 
         # Process a full job (download + all clips)

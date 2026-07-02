@@ -9,6 +9,10 @@
   ALL filter times by +0.5s — subs, tracking pans, silence cuts)
 - Dual-mode crop uses exact canvas dims (was estimated → skewed framing)
 - Smooth camera re-anchor (was a visible jump every 3s)
+- VPS fallback for browser generation: if the direct download fails/stalls,
+  the VPS downloads via yt-dlp (/fetch) and serves it back with Range
+  support (/file/<id>) through the Convex proxy — generation continues
+  in the browser automatically
 - Full E2E pipeline for normal YouTube videos (tested with Rick Astley)
 - Auto-generation (no manual "Generează" button needed)
 - Audio in shorts (separate video+audio download, ffmpeg.wasm muxing)

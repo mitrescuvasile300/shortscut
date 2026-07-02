@@ -226,6 +226,8 @@ export function JobDetailPage() {
   const refreshDownloadUrls = useAction(api.processing.refreshDownloadUrls);
   const startProcessing = useAction(api.processing.processJob);
   const startServerProcessing = useAction(api.serverProcessing.processJobOnServer);
+  const startVpsFetch = useAction(api.serverProcessing.startVpsFetch);
+  const getVpsFetchStatus = useAction(api.serverProcessing.getVpsFetchStatus);
 
 
   const [processing, setProcessing] = useState(false);
@@ -326,13 +328,82 @@ export function JobDetailPage() {
         };
       });
 
-      // Process all clips (pass audio URL for muxing if available)
-      const results = await processAllClips(
-        videoUrl,
-        clipConfigs,
-        setProgress,
-        audioUrl,
-      );
+      // Process all clips (pass audio URL for muxing if available).
+      // If the direct download fails or stalls (YouTube blocking, expired
+      // URL, dead Piped instance...), fall back to sourcing the video
+      // through the VPS: it downloads with yt-dlp and serves the file
+      // back with Range support, relayed through the Convex proxy.
+      let results: Map<number, Blob>;
+      try {
+        results = await processAllClips(
+          videoUrl,
+          clipConfigs,
+          setProgress,
+          audioUrl,
+        );
+      } catch (directErr) {
+        console.warn(
+          "[generate] Direct download failed → VPS fallback:",
+          directErr,
+        );
+        toast.info("Descărcarea directă a eșuat — trec prin VPS...");
+        setProgress({
+          clipIndex: 0,
+          totalClips: clips.length,
+          stage: "downloading",
+          percent: 0,
+          message: "Se descarcă video-ul pe server (VPS)...",
+        });
+
+        const { fetchId, error: fetchErr } = await startVpsFetch({
+          jobId: jobId as Id<"jobs">,
+        });
+        if (!fetchId) {
+          throw new Error(
+            `Descărcare directă eșuată (${directErr instanceof Error ? directErr.message : "eroare"}), ` +
+              `iar VPS-ul nu răspunde: ${fetchErr}`,
+          );
+        }
+
+        // Poll until the VPS finished downloading (max 15 min)
+        let vpsFileUrl: string | null = null;
+        const deadline = Date.now() + 15 * 60 * 1000;
+        while (Date.now() < deadline) {
+          await new Promise(r => setTimeout(r, 4000));
+          const st = await getVpsFetchStatus({ fetchId });
+          if (st.status === "ready" && st.fileUrl) {
+            vpsFileUrl = st.fileUrl;
+            break;
+          }
+          if (st.status === "error") {
+            throw new Error(`Descărcare VPS eșuată: ${st.error || "necunoscut"}`);
+          }
+          setProgress({
+            clipIndex: 0,
+            totalClips: clips.length,
+            stage: "downloading",
+            percent: 5,
+            message: `Se descarcă pe server (VPS)...${st.size ? ` ${(st.size / 1e6).toFixed(0)}MB` : ""}`,
+          });
+        }
+        if (!vpsFileUrl) {
+          throw new Error("Descărcarea pe VPS a durat prea mult (15 min)");
+        }
+
+        // Relay through the Convex proxy (VPS is plain http — the browser
+        // can't fetch it directly from an https page)
+        const vpsProxied = convexSiteUrl
+          ? `${convexSiteUrl}/api/video-proxy?url=${encodeURIComponent(vpsFileUrl)}`
+          : vpsFileUrl;
+
+        // VPS file is already muxed (video+audio) → no separate audio URL
+        results = await processAllClips(
+          vpsProxied,
+          clipConfigs,
+          setProgress,
+          null,
+        );
+      }
 
       // Create blob URLs for preview
       const newBlobs = new Map<number, { blob: Blob; url: string }>();
@@ -397,6 +468,8 @@ export function JobDetailPage() {
     saveShort,
     markJobCompleted,
     refreshDownloadUrls,
+    startVpsFetch,
+    getVpsFetchStatus,
   ]);
 
   // Auto-trigger generation when job reaches "generating" status
@@ -812,11 +885,37 @@ export function JobDetailPage() {
                     </p>
                   </div>
                 </div>
-                {/* Refresh URL for lower quality */}
-                <div className="mt-3 pt-3 border-t border-primary/20 flex items-center justify-between">
+                {/* Refresh URL / server processing fallbacks */}
+                <div className="mt-3 pt-3 border-t border-primary/20 flex items-center justify-between gap-2 flex-wrap">
                   <span className="text-xs text-muted-foreground">
-                    Video prea mare? Reîmprospătează URL-ul.
+                    Blocat? Reîmprospătează URL-ul sau procesează pe server.
                   </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="text-xs h-7 border-blue-500/50 text-blue-400 hover:bg-blue-500/10"
+                    disabled={serverProcessing}
+                    onClick={async () => {
+                      if (!jobId) return;
+                      serverModeRef.current = true;
+                      setServerProcessing(true);
+                      try {
+                        await startServerProcessing({ jobId: jobId as Id<"jobs"> });
+                        toast.success("Shorts-urile au fost generate pe server! 🎉");
+                      } catch (_err) {
+                        console.error("Server processing failed:", _err);
+                        toast.error(
+                          `Eroare procesare server: ${_err instanceof Error ? _err.message : "necunoscută"}`,
+                        );
+                      } finally {
+                        setServerProcessing(false);
+                        serverModeRef.current = false;
+                      }
+                    }}
+                  >
+                    <Server className="size-3 mr-1" />
+                    Procesează pe Server
+                  </Button>
                   <Button
                     size="sm"
                     variant="ghost"
