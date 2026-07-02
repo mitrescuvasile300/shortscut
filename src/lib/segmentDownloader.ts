@@ -98,13 +98,19 @@ export async function getFileSize(url: string): Promise<number> {
  * @param clipStartTime Clip start time in seconds
  * @param clipEndTime   Clip end time in seconds
  * @param onProgress    Optional progress callback (0–100)
+ * @param opts          allowAudioOnly: accept files without a video track
+ *                      (e.g. YouTube DASH .m4a audio) — seeks on the audio
+ *                      track instead. Used for per-clip audio download on
+ *                      long videos.
  * @returns             SegmentResult with fMP4 data and video dimensions
+ *                      (0×0 for audio-only files)
  */
 export async function downloadClipSegment(
   url: string,
   clipStartTime: number,
   clipEndTime: number,
   onProgress?: (pct: number) => void,
+  opts?: { allowAudioOnly?: boolean },
 ): Promise<SegmentResult> {
   // Probe file size
   const fileSize = await getFileSize(url);
@@ -178,15 +184,19 @@ export async function downloadClipSegment(
           }
           if (t.type === "audio" && !aTrack) aTrack = t.id;
         }
-        if (!vTrack) return finish(new Error("No video track in MP4"));
+        if (!vTrack && !(opts?.allowAudioOnly && aTrack)) {
+          return finish(new Error("No video track in MP4"));
+        }
 
         console.log(
-          `[segDL] Video track ${vTrack}: ${vW}×${vH}` +
+          `[segDL] ${vTrack ? `Video track ${vTrack}: ${vW}×${vH}` : "Audio-only file"}` +
             (aTrack ? `, Audio track ${aTrack}` : ""),
         );
 
         // Configure segmentation
-        file.setSegmentOptions(vTrack, null, { nbSamples: 5000 });
+        if (vTrack) {
+          file.setSegmentOptions(vTrack, null, { nbSamples: 5000 });
+        }
         if (aTrack) {
           file.setSegmentOptions(aTrack, null, { nbSamples: 10000 });
         }

@@ -1941,6 +1941,73 @@ export const refreshVideoUrl = action({
 });
 
 // ═══════════════════════════════════════════════════════════════════
+// refreshDownloadUrls — like refreshVideoUrl but returns BOTH fresh
+// URLs. The browser pipeline needs the fresh audio URL too, otherwise
+// long-video muxing runs against an expired audio link.
+// ═══════════════════════════════════════════════════════════════════
+
+export const refreshDownloadUrls = action({
+  args: { jobId: v.id("jobs") },
+  returns: v.object({
+    videoUrl: v.union(v.string(), v.null()),
+    audioUrl: v.union(v.string(), v.null()),
+  }),
+  handler: async (ctx, { jobId }) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new Error("Not authenticated");
+
+    const job = await ctx.runQuery(
+      // biome-ignore lint: internal query
+      (await import("./_generated/api")).api.jobs.get as any,
+      { id: jobId },
+    );
+    if (!job) throw new Error("Job not found");
+
+    const videoId = extractVideoId(job.videoUrl);
+    if (!videoId) throw new Error("Invalid YouTube URL");
+
+    // Try Piped first (most reliable)
+    const piped = await fetchFromPiped(videoId);
+    if (piped?.videoUrl) {
+      await ctx.runMutation(internal.processing.updateJobStatus, {
+        jobId,
+        status: job.status as "generating" | "completed",
+        videoDownloadUrl: piped.videoUrl,
+        audioDownloadUrl: piped.audioUrl || undefined,
+        videoDownloadExpiry: Date.now() + 3600000,
+      });
+      return { videoUrl: piped.videoUrl, audioUrl: piped.audioUrl || null };
+    }
+
+    // Fallback to InnerTube
+    const settings = await ctx.runQuery(internal.processing.getUserSettings, {
+      userId,
+    });
+    const cookieHeader = settings?.youtubeCookies
+      ? parseCookiesToHeader(settings.youtubeCookies)
+      : undefined;
+    const streams = await getYouTubeStreamUrls(
+      job.videoUrl,
+      "both",
+      cookieHeader,
+    );
+    if (streams.videoUrl) {
+      await ctx.runMutation(internal.processing.updateJobStatus, {
+        jobId,
+        status: job.status as "generating" | "completed",
+        videoDownloadUrl: streams.videoUrl,
+        audioDownloadUrl: streams.audioUrl || undefined,
+        videoDownloadExpiry: Date.now() + 3600000,
+      });
+    }
+    return {
+      videoUrl: streams.videoUrl || null,
+      audioUrl: streams.audioUrl || null,
+    };
+  },
+});
+
+// ═══════════════════════════════════════════════════════════════════
 // analyzeTranscript — kept for backward compatibility (HTTP endpoint)
 // ═══════════════════════════════════════════════════════════════════
 

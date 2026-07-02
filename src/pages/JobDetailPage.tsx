@@ -198,7 +198,7 @@ export function JobDetailPage() {
   const generateUploadUrl = useMutation(api.shorts.generateUploadUrl);
   const saveShort = useMutation(api.shorts.save);
   const markJobCompleted = useMutation(api.shorts.markJobCompleted);
-  const refreshVideoUrl = useAction(api.processing.refreshVideoUrl);
+  const refreshDownloadUrls = useAction(api.processing.refreshDownloadUrls);
   const startProcessing = useAction(api.processing.processJob);
   const startServerProcessing = useAction(api.serverProcessing.processJobOnServer);
 
@@ -252,9 +252,11 @@ export function JobDetailPage() {
           percent: 0,
           message: "Se obține link-ul de descărcare...",
         });
-        videoUrl =
-          (await refreshVideoUrl({ jobId: jobId as Id<"jobs"> })) ?? undefined;
-        // audioUrl will be refreshed too via the backend
+        const fresh = await refreshDownloadUrls({
+          jobId: jobId as Id<"jobs">,
+        });
+        videoUrl = fresh.videoUrl ?? undefined;
+        audioUrl = fresh.audioUrl ?? undefined;
       }
 
       if (!videoUrl) {
@@ -369,7 +371,7 @@ export function JobDetailPage() {
     generateUploadUrl,
     saveShort,
     markJobCompleted,
-    refreshVideoUrl,
+    refreshDownloadUrls,
   ]);
 
   // Auto-trigger generation when job reaches "generating" status
@@ -507,8 +509,9 @@ export function JobDetailPage() {
                 </h3>
                 <p className="text-sm text-muted-foreground max-w-md">
                   Totul se face automat: transcriere → analiză AI → face
-                  detection → crop 9:16 → subtitrări. Nu ai nevoie de nimic
-                  instalat.
+                  detection → crop 9:16 → subtitrări. Funcționează și pentru
+                  video-uri lungi (podcast-uri) — se descarcă doar segmentele
+                  clipurilor. Nu ai nevoie de nimic instalat.
                 </p>
               </div>
               <Button
@@ -798,8 +801,8 @@ export function JobDetailPage() {
                       if (!jobId) return;
                       setServerProcessing(true);
                       try {
-                        const newUrl = await refreshVideoUrl({ jobId: jobId as Id<"jobs"> });
-                        if (newUrl) {
+                        const fresh = await refreshDownloadUrls({ jobId: jobId as Id<"jobs"> });
+                        if (fresh.videoUrl) {
                           toast.success("URL reîmprospătat! Reîncearcă generarea.");
                         } else {
                           toast.error("Nu s-a putut obține un URL nou.");

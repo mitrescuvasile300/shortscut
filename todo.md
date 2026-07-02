@@ -1,6 +1,8 @@
 # ShortsCut — Current Status
 
 ## ✅ Working
+- Long videos (podcasts) fully in browser — no 150MB limit: per-clip video
+  AND audio segment downloads via HTTP Range + mp4box (no python/sh needed)
 - Full E2E pipeline for normal YouTube videos (tested with Rick Astley)
 - Auto-generation (no manual "Generează" button needed)
 - Audio in shorts (separate video+audio download, ffmpeg.wasm muxing)

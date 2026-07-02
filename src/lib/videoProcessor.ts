@@ -920,28 +920,51 @@ async function processAllClipsSegmented(
 ): Promise<Map<number, Blob>> {
   const results = new Map<number, Blob>();
 
-  // Download full audio if separate (it's small, typically 2–10 MB)
+  // ── Audio strategy ────────────────────────────────────────────────
+  // Short videos: the separate audio track is small (2–10 MB) → download
+  // it once in full. Long videos (podcasts): the m4a can be 100+ MB, so
+  // download only each clip's audio segment via Range requests, exactly
+  // like the video track.
+  const AUDIO_FULL_MAX = 30 * 1024 * 1024;
   let audioData: Uint8Array | null = null;
+  let audioSegmented = false;
   if (audioUrl) {
-    onProgress({
-      clipIndex: 0,
-      totalClips: clips.length,
-      stage: "downloading",
-      percent: 0,
-      message: "Se descarcă audio-ul...",
-    });
-    audioData = await downloadVideo(audioUrl, (p) =>
+    let audioSize = 0;
+    let audioRangeOk = false;
+    try {
+      [audioRangeOk, audioSize] = await Promise.all([
+        supportsRangeRequests(audioUrl),
+        getFileSize(audioUrl),
+      ]);
+    } catch {
+      /* fall back to full download */
+    }
+    if (audioRangeOk && audioSize > AUDIO_FULL_MAX) {
+      audioSegmented = true;
+      console.log(
+        `[segmented] Audio ${(audioSize / 1e6).toFixed(1)} MB > 30 MB → per-clip segment download`,
+      );
+    } else {
       onProgress({
         clipIndex: 0,
         totalClips: clips.length,
         stage: "downloading",
-        percent: Math.round(p * 0.3),
-        message: `Se descarcă audio... ${p}%`,
-      }),
-    );
-    console.log(
-      `[segmented] Audio: ${(audioData.length / 1e6).toFixed(1)} MB`,
-    );
+        percent: 0,
+        message: "Se descarcă audio-ul...",
+      });
+      audioData = await downloadVideo(audioUrl, (p) =>
+        onProgress({
+          clipIndex: 0,
+          totalClips: clips.length,
+          stage: "downloading",
+          percent: Math.round(p * 0.3),
+          message: `Se descarcă audio... ${p}%`,
+        }),
+      );
+      console.log(
+        `[segmented] Audio: ${(audioData.length / 1e6).toFixed(1)} MB`,
+      );
+    }
   }
 
   const ffmpeg = await ffmpegPromise;
@@ -983,7 +1006,54 @@ async function processAllClipsSegmented(
       await ffmpeg.writeFile("source.mp4", seg.data);
 
       // ── 3. Mux with audio if separate ────────────────────────────
-      if (audioData) {
+      if (audioSegmented && audioUrl) {
+        onProgress({
+          clipIndex: n,
+          totalClips: clips.length,
+          stage: "downloading",
+          percent: 0,
+          message: `Se descarcă audio segment ${n}/${clips.length}...`,
+        });
+        try {
+          const aseg = await downloadClipSegment(
+            audioUrl,
+            clip.startTime,
+            clip.endTime,
+            undefined,
+            { allowAudioOnly: true },
+          );
+          await ffmpeg.writeFile("audio_seg.m4a", aseg.data);
+          // Both fMP4 segments keep the original absolute timestamps,
+          // so a straight stream-copy mux stays in sync — the later
+          // per-clip seek (-ss clip.startTime) applies to both streams.
+          await ffmpeg.exec([
+            "-i",
+            "source.mp4",
+            "-i",
+            "audio_seg.m4a",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c",
+            "copy",
+            "-y",
+            "muxed.mp4",
+          ]);
+          await ffmpeg.deleteFile("audio_seg.m4a").catch(() => {});
+          await ffmpeg.deleteFile("source.mp4").catch(() => {});
+          const muxData = (await ffmpeg.readFile(
+            "muxed.mp4",
+          )) as Uint8Array;
+          await ffmpeg.writeFile("source.mp4", muxData);
+          await ffmpeg.deleteFile("muxed.mp4").catch(() => {});
+        } catch (audioErr) {
+          console.warn(
+            `[segmented] Audio segment clip ${n} failed — continuing without separate audio:`,
+            audioErr,
+          );
+        }
+      } else if (audioData) {
         onProgress({
           clipIndex: n,
           totalClips: clips.length,
@@ -1163,33 +1233,36 @@ export async function processAllClips(
   const ffmpegPromise = getFFmpeg(onProgress);
 
   // ── Decide download strategy ─────────────────────────────────────
-  // For large files (>50 MB), use per-clip segment download to avoid
-  // allocating the full video in browser memory (fixes "Array buffer
-  // allocation failed" with 4K / long videos).
-  const MAX_BROWSER_SIZE = 150 * 1024 * 1024; // 150MB hard limit for browser
+  // Videos above 50 MB are processed with per-clip segment downloads
+  // (HTTP Range + mp4box.js), so the full video NEVER has to fit in
+  // browser memory. There is no upper size limit on this path — hour-long
+  // podcasts work fine because only each clip's slice is downloaded.
+  // A full download is used only for small files, or as fallback when the
+  // CDN/proxy doesn't support Range requests (capped at 150 MB to avoid
+  // "Array buffer allocation failed" in WebAssembly).
+  const SEGMENT_THRESHOLD = 50 * 1024 * 1024; // prefer segmented above this
+  const MAX_FULL_DOWNLOAD = 150 * 1024 * 1024; // full-download hard limit
   let useSegmented = false;
-  // detectedSize used for logging only
+  let totalSize = 0;
   try {
-    const [rangeOk, totalSize] = await Promise.all([
+    const [rangeOk, probedSize] = await Promise.all([
       supportsRangeRequests(videoUrl),
       getFileSize(videoUrl),
     ]);
-    // detectedSize = totalSize;
-    if (totalSize > MAX_BROWSER_SIZE) {
-      console.error(
-        `[processAllClips] Video ${(totalSize / 1e6).toFixed(0)}MB exceeds ${MAX_BROWSER_SIZE / 1e6}MB browser limit`,
-      );
-      throw new Error(
-        `Video prea mare pentru browser (${(totalSize / 1e6).toFixed(0)}MB). ` +
-        `Reîmprospătează URL-ul pentru calitate mai mică.`,
-      );
-    }
-    if (rangeOk && totalSize > 50 * 1024 * 1024) {
+    totalSize = probedSize;
+    if (rangeOk && totalSize > SEGMENT_THRESHOLD) {
       console.log(
-        `[processAllClips] ${(totalSize / 1e6).toFixed(0)} MB > 50 MB threshold → segment download`,
+        `[processAllClips] ${(totalSize / 1e6).toFixed(0)} MB > 50 MB threshold → segment download (no size limit)`,
       );
       useSegmented = true;
-    } else if (rangeOk && totalSize > 0) {
+    } else if (!rangeOk && totalSize > MAX_FULL_DOWNLOAD) {
+      // Can't segment (no Range support) and too big to hold in memory
+      throw new Error(
+        `Video prea mare pentru descărcare completă (${(totalSize / 1e6).toFixed(0)}MB) ` +
+          `și sursa nu suportă descărcare pe segmente. ` +
+          `Reîmprospătează URL-ul sau folosește "Procesează pe Server".`,
+      );
+    } else if (totalSize > 0) {
       console.log(
         `[processAllClips] ${(totalSize / 1e6).toFixed(0)} MB ≤ 50 MB → full download`,
       );
@@ -1211,6 +1284,20 @@ export async function processAllClips(
         prewarm,
       );
     } catch (e) {
+      // Only fall back to a full download when the file actually fits in
+      // browser memory. For long videos, re-throw with a clear message
+      // instead of crashing the tab with a 1 GB+ allocation.
+      if (totalSize > MAX_FULL_DOWNLOAD) {
+        console.error(
+          "[processAllClips] Segment download failed and file too large for full download:",
+          e,
+        );
+        throw new Error(
+          `Descărcarea pe segmente a eșuat (${e instanceof Error ? e.message : "eroare"}) ` +
+            `iar video-ul de ${(totalSize / 1e6).toFixed(0)}MB nu încape în memoria browser-ului. ` +
+            `Reîmprospătează URL-ul sau folosește "Procesează pe Server".`,
+        );
+      }
       console.warn(
         "[processAllClips] Segment download failed, falling back to full download:",
         e,
