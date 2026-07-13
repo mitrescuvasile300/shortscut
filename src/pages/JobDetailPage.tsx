@@ -328,7 +328,31 @@ export function JobDetailPage() {
         };
       });
 
-      // Process all clips (pass audio URL for muxing if available).
+      // Very long selections are too expensive for ffmpeg.wasm and may crash
+      // the browser tab while the processor is loading. Process those with
+      // native ffmpeg on the VPS instead (the server already has the clips,
+      // transcript and YouTube cookies).
+      const totalSelectedDuration = clipConfigs.reduce(
+        (sum, clip) => sum + Math.max(0, clip.endTime - clip.startTime),
+        0,
+      );
+      const shouldUseServer =
+        clipConfigs.some(clip => clip.endTime - clip.startTime > 120) ||
+        totalSelectedDuration > 300;
+      if (shouldUseServer) {
+        toast.info("Clipurile lungi se procesează pe server pentru stabilitate...");
+        setProgress({
+          clipIndex: 0,
+          totalClips: clips.length,
+          stage: "processing",
+          percent: 5,
+          message: "Se procesează clipurile lungi pe server (VPS)...",
+        });
+        await startServerProcessing({ jobId: jobId as Id<"jobs"> });
+        return;
+      }
+
+      // Process shorter clips in the browser (pass audio URL for muxing if available).
       // If the direct download fails or stalls (YouTube blocking, expired
       // URL, dead Piped instance...), fall back to sourcing the video
       // through the VPS: it downloads with yt-dlp and serves the file
@@ -468,6 +492,7 @@ export function JobDetailPage() {
     saveShort,
     markJobCompleted,
     refreshDownloadUrls,
+    startServerProcessing,
     startVpsFetch,
     getVpsFetchStatus,
   ]);

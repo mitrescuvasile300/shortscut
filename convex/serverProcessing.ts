@@ -133,6 +133,12 @@ export const processJobOnServer = action({
       );
     }
 
+    // Get user cookies as well: /process may need yt-dlp to download the
+    // original YouTube URL, and YouTube rejects the VPS without them.
+    const settings = await ctx.runQuery(internal.processing.getUserSettings, {
+      userId,
+    });
+
     // Get transcript segments for subtitle generation
     let allSegments: SubtitleSegment[] = [];
     if (job.transcriptSegments) {
@@ -188,6 +194,7 @@ export const processJobOnServer = action({
           video_url: videoUrl,
           audio_url: audioUrl,
           youtube_url: !videoUrl ? youtubeUrl : undefined,
+          cookies: settings?.youtubeCookies || undefined,
           clips: clipConfigs,
         }),
         signal: controller.signal,

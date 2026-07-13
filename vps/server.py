@@ -591,19 +591,21 @@ def _build_silence_removal_filters(segs, plan, out_w, out_h, has_subs, subs_path
     return {"filter_complex": fc, "out_v": "[cv]", "out_a": "[ca]"}
 
 
-def download_video(video_url, audio_url, work_dir):
+def download_video(video_url, audio_url, work_dir, cookies_text=None):
     """Download video (and optionally separate audio) to work_dir. Returns input path and video dimensions."""
     video_path = os.path.join(work_dir, "source.mp4")
 
     # Try yt-dlp first for YouTube URLs
     if "youtube.com" in video_url or "youtu.be" in video_url:
         log.info("Downloading with yt-dlp...")
+        cookies_path = _write_cookies_file(cookies_text, work_dir) if cookies_text else None
         args = [
             "yt-dlp",
             "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
             "--merge-output-format", "mp4",
             "-o", video_path,
             "--no-playlist",
+            *(["--cookies", cookies_path] if cookies_path else []),
             video_url,
         ]
         _, stderr, rc = run_cmd(args, timeout=300, cwd=work_dir)
@@ -859,6 +861,7 @@ class Handler(BaseHTTPRequestHandler):
             audio_url = body.get("audio_url")
             youtube_url = body.get("youtube_url")
             clips = body.get("clips", [])
+            cookies_text = body.get("cookies")
             provided_width = body.get("video_width")
             provided_height = body.get("video_height")
 
@@ -881,7 +884,9 @@ class Handler(BaseHTTPRequestHandler):
 
                 # Download video
                 dl_url = youtube_url or video_url
-                input_path, det_width, det_height = download_video(dl_url, audio_url, work_dir)
+                input_path, det_width, det_height = download_video(
+                    dl_url, audio_url, work_dir, cookies_text
+                )
                 video_width = provided_width or det_width
                 video_height = provided_height or det_height
 
