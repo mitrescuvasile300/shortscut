@@ -23,8 +23,18 @@ from pathlib import Path
 # ── Config ────────────────────────────────────────────────────────────
 API_KEY = os.environ.get("SHORTSCUT_API_KEY", "shortcut-vps-2026")
 PORT = int(os.environ.get("PORT", "3458"))
-WORK_DIR = Path("/tmp/shortscut-processing")
-WORK_DIR.mkdir(parents=True, exist_ok=True)
+# Keep runtime files outside /tmp: systemd-tmpfiles may delete an old /tmp
+# directory while this long-running service is still active.
+WORK_DIR = Path(os.environ.get("SHORTSCUT_WORK_DIR", "/var/lib/shortscut-processing"))
+
+
+def ensure_work_dir():
+    """Recreate the runtime directory if an external cleanup removed it."""
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    return WORK_DIR
+
+
+ensure_work_dir()
 MAX_CONCURRENT = 2
 
 logging.basicConfig(
@@ -81,7 +91,8 @@ def cleanup_old_fetches():
     for fid in [f for f, i in list(fetch_jobs.items()) if now - i["created"] > FETCH_TTL]:
         info = fetch_jobs.pop(fid, None)
         if info and info.get("path") and os.path.exists(info["path"]):
-            os.unlink(info["path"])
+            fetch_dir = os.path.dirname(info["path"])
+            shutil.rmtree(fetch_dir, ignore_errors=True)
             log.info(f"Cleaned up fetched source: {fid}")
 
 
@@ -89,8 +100,14 @@ def _fetch_worker(fetch_id, video_url, fmt="video", cookies_text=None):
     """Background download of a source video/audio via yt-dlp."""
     info = fetch_jobs[fetch_id]
     ext = "m4a" if fmt == "audio" else "mp4"
-    out_path = os.path.join(str(WORK_DIR), f"src_{fetch_id}.{ext}")
+    fetch_dir = None
+    out_path = None
     try:
+        ensure_work_dir()
+        # Cookies must be private to this fetch. A shared cookies.txt races with
+        # transcript cleanup and concurrent fetches.
+        fetch_dir = tempfile.mkdtemp(prefix=f"fetch_{fetch_id}_", dir=WORK_DIR)
+        out_path = os.path.join(fetch_dir, f"source.{ext}")
         if fmt == "audio":
             args = [
                 "yt-dlp",
@@ -106,7 +123,7 @@ def _fetch_worker(fetch_id, video_url, fmt="video", cookies_text=None):
                 "-o", out_path,
                 "--no-playlist",
             ]
-        cookies_path = _write_cookies_file(cookies_text, str(WORK_DIR)) if cookies_text else None
+        cookies_path = _write_cookies_file(cookies_text, fetch_dir) if cookies_text else None
         if cookies_path:
             args += ["--cookies", cookies_path]
         args.append(video_url)
@@ -142,8 +159,8 @@ def _fetch_worker(fetch_id, video_url, fmt="video", cookies_text=None):
     except Exception as e:
         log.error(f"[fetch {fetch_id}] failed: {e}")
         info.update({"status": "error", "error": str(e)})
-        if os.path.exists(out_path):
-            os.unlink(out_path)
+        if fetch_dir:
+            shutil.rmtree(fetch_dir, ignore_errors=True)
 
 
 def cleanup_old_files(max_age_secs=1800):
@@ -857,6 +874,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response(503, {"error": "Server busy, try again later"})
                 return
 
+            ensure_work_dir()
             work_dir = tempfile.mkdtemp(dir=WORK_DIR)
             try:
                 cleanup_old_files()
@@ -940,6 +958,7 @@ class Handler(BaseHTTPRequestHandler):
                 lang, f"{lang}-orig", "en", "en-orig",
             ]))
 
+            ensure_work_dir()
             work_dir = tempfile.mkdtemp(dir=WORK_DIR)
             try:
                 log.info(f"[transcript] Extracting subtitles for {video_url} (langs={lang_list})")
