@@ -36,24 +36,52 @@ function getSegmentsForClip(
   clipStart: number,
   clipEnd: number,
 ): SubtitleSegment[] {
-  return allSegments
-    .filter((seg) => seg.end > clipStart && seg.start < clipEnd)
-    .map((seg) => ({
+  const raw = allSegments
+    .filter(seg => seg.end > clipStart && seg.start < clipEnd)
+    .map(seg => ({
       start: Math.max(0, seg.start - clipStart),
       end: Math.min(clipEnd - clipStart, seg.end - clipStart),
-      text: seg.text.replace(/\n/g, " ").trim(),
+      text: seg.text.replace(/\n/g, " ").replace(/\s+/g, " ").trim(),
     }))
-    .filter((seg) => seg.text.length > 0);
+    .filter(seg => seg.text.length > 0)
+    .sort((a, b) => a.start - b.start);
+
+  // YouTube rolling captions overlap heavily. First make each cue exclusive,
+  // then merge short fragments into readable sentence-like cards.
+  const exclusive = raw.map((seg, i) => ({
+    ...seg,
+    end: Math.max(seg.start + 0.15, Math.min(seg.end, raw[i + 1]?.start ?? seg.end)),
+  }));
+  const grouped: SubtitleSegment[] = [];
+  for (const seg of exclusive) {
+    const prev = grouped[grouped.length - 1];
+    const canMerge =
+      prev &&
+      !/[.!?]["']?$/.test(prev.text) &&
+      prev.text.length + 1 + seg.text.length <= 64 &&
+      seg.start - prev.end <= 0.35;
+    if (canMerge) {
+      prev.text = `${prev.text} ${seg.text}`;
+      prev.end = seg.end;
+    } else {
+      grouped.push({ ...seg });
+    }
+  }
+  // A cue must never coexist with the next cue.
+  return grouped.map((seg, i) => ({
+    ...seg,
+    end: Math.max(seg.start + 0.15, Math.min(seg.end, grouped[i + 1]?.start ?? seg.end)),
+  }));
 }
 
 function generateAssSubtitles(
   segments: SubtitleSegment[],
-  width = 1080,
-  height = 1920,
+  width = 720,
+  height = 1280,
 ): string {
-  const fontSize = 48;
-  const marginV = 120;
-  const outlineSize = 3;
+  const fontSize = 58;
+  const marginV = 110;
+  const outlineSize = 4;
 
   let ass = `[Script Info]
 Title: ShortsCut Subtitles
@@ -81,7 +109,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const lines: string[] = [];
     let currentLine = "";
     for (const word of words) {
-      if (currentLine.length + word.length + 1 > 30 && currentLine.length > 0) {
+      if (currentLine.length + word.length + 1 > 22 && currentLine.length > 0) {
         lines.push(currentLine);
         currentLine = word;
       } else {
@@ -89,7 +117,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
       }
     }
     if (currentLine) lines.push(currentLine);
-    text = lines.join("\\N");
+    // Keep a single card to at most two lines. Grouping above limits cards to
+    // 64 chars; this fallback balances long lines rather than stacking cues.
+    if (lines.length > 2) {
+      const midpoint = Math.ceil(words.length / 2);
+      text = `${words.slice(0, midpoint).join(" ")}\\N${words.slice(midpoint).join(" ")}`;
+    } else {
+      text = lines.join("\\N");
+    }
 
     ass += `Dialogue: 0,${formatAssTime(seg.start)},${formatAssTime(seg.end)},Default,,0,0,0,,${text}\n`;
   }
@@ -138,9 +173,34 @@ export const processJobOnServer = action({
       userId,
     });
 
-    // Get transcript segments for subtitle generation
+    // Always fetch fresh English captions for the burned subtitles. The
+    // transcript stored on the job follows the analysis language (often RO),
+    // but Alex wants captions in the original spoken English.
     let allSegments: SubtitleSegment[] = [];
-    if (job.transcriptSegments) {
+    try {
+      const transcriptResp = await fetch(`${VPS_URL}/transcript`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-API-Key": VPS_API_KEY,
+        },
+        body: JSON.stringify({
+          video_url: youtubeUrl,
+          lang: "en",
+          cookies: settings?.youtubeCookies || undefined,
+        }),
+      });
+      if (transcriptResp.ok) {
+        const transcriptData = (await transcriptResp.json()) as {
+          segments?: SubtitleSegment[];
+        };
+        allSegments = transcriptData.segments || [];
+      }
+    } catch (error) {
+      console.error("[serverProcessing] English captions fetch failed:", error);
+    }
+    // Last-resort fallback keeps subtitles rather than dropping them entirely.
+    if (allSegments.length === 0 && job.transcriptSegments) {
       try {
         allSegments = JSON.parse(job.transcriptSegments);
       } catch {

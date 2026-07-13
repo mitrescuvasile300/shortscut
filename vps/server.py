@@ -962,8 +962,12 @@ class Handler(BaseHTTPRequestHandler):
             # yt-dlp for ONLY "ro" then returned zero files → 404 → the whole
             # pipeline failed. Request the job language AND the original/
             # English tracks in one pass; the parser prefers the first match.
+            # Shorts subtitles should preserve the spoken English, regardless
+            # of the UI/analysis language (titles and reasoning may still be RO).
+            # Prefer the original English track, then English auto-captions,
+            # and only then the requested-language fallback.
             lang_list = ",".join(dict.fromkeys([
-                lang, f"{lang}-orig", "en", "en-orig",
+                "en-orig", "en", lang, f"{lang}-orig",
             ]))
 
             ensure_work_dir()
