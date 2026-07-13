@@ -332,13 +332,11 @@ export function JobDetailPage() {
       // the browser tab while the processor is loading. Process those with
       // native ffmpeg on the VPS instead (the server already has the clips,
       // transcript and YouTube cookies).
-      const totalSelectedDuration = clipConfigs.reduce(
-        (sum, clip) => sum + Math.max(0, clip.endTime - clip.startTime),
-        0,
-      );
-      const shouldUseServer =
-        clipConfigs.some(clip => clip.endTime - clip.startTime > 120) ||
-        totalSelectedDuration > 300;
+      // Automatic generation must be reliable for every job. Browser
+      // ffmpeg.wasm can hang at 0% or crash the tab even for shorter clips,
+      // depending on memory/browser extensions. Keep it only as an explicit
+      // future opt-in; the default pipeline always uses native VPS ffmpeg.
+      const shouldUseServer = true;
       if (shouldUseServer) {
         toast.info("Clipurile lungi se procesează pe server pentru stabilitate...");
         setProgress({

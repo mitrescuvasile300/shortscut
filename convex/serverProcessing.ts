@@ -182,7 +182,10 @@ export const processJobOnServer = action({
       );
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 600000); // 10 min timeout
+      // Convex/undici aborts idle HTTP responses after ~5 minutes even when
+      // our AbortController allows longer. The VPS must send response headers
+      // immediately and stream heartbeat bytes while ffmpeg is working.
+      const timeoutId = setTimeout(() => controller.abort(), 20 * 60 * 1000);
 
       const response = await fetch(`${VPS_URL}/process`, {
         method: "POST",

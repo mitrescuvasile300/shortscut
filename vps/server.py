@@ -372,7 +372,10 @@ def process_clip(input_path, clip_config, video_width, video_height, work_dir):
     end_time = clip_config["end_time"]
     duration = end_time - start_time
     index = clip_config.get("index", 0)
-    out_w, out_h = 1080, 1920
+    # 720x1280 is native Shorts HD and keeps a 5-minute clip well below
+    # Convex's upstream response timeout. 1080x1920 made long jobs take
+    # 7-10 minutes before the VPS could return any headers.
+    out_w, out_h = 720, 1280
     has_subs = bool(clip_config.get("ass_subtitles"))
     ass_content = clip_config.get("ass_subtitles", "")
     remove_silence = clip_config.get("remove_silence", True)
