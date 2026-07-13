@@ -191,9 +191,12 @@ export const processJobOnServer = action({
           "X-API-Key": VPS_API_KEY,
         },
         body: JSON.stringify({
-          video_url: videoUrl,
-          audio_url: audioUrl,
-          youtube_url: !videoUrl ? youtubeUrl : undefined,
+          // Always let the VPS download the original YouTube URL with the
+          // user's cookies. Piped/InnerTube media URLs frequently expire or
+          // return an HTML error page that ffmpeg reports as "moov atom not found".
+          video_url: undefined,
+          audio_url: undefined,
+          youtube_url: youtubeUrl,
           cookies: settings?.youtubeCookies || undefined,
           clips: clipConfigs,
         }),
