@@ -124,7 +124,6 @@ export const processJobOnServer = action({
 
     // Get video download URL
     const videoUrl = job.videoDownloadUrl;
-    const audioUrl = job.audioDownloadUrl || null;
     const youtubeUrl = job.videoUrl;
 
     if (!videoUrl && !youtubeUrl) {
