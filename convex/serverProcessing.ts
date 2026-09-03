@@ -48,12 +48,19 @@ function getSegmentsForClip(
 
 function generateAssSubtitles(
   segments: SubtitleSegment[],
-  width = 1080,
-  height = 1920,
+  width = 720,
+  height = 1280,
 ): string {
-  const fontSize = 48;
-  const marginV = 120;
-  const outlineSize = 3;
+  // Fallback only (used when the VPS can't run Whisper). Same look as the
+  // local script's generate_ass_subtitles(): Arial Black, sizes relative to
+  // the output height, ~4 UPPERCASE words per line. Caption segments have no
+  // word timings, so each segment is split into 4-word groups with times
+  // distributed proportionally.
+  const fontSize = Math.floor(height * 0.052);
+  const outline = Math.floor(height * 0.004);
+  const shadow = Math.floor(height * 0.003);
+  const marginV = Math.floor(height * 0.15);
+  const wordsPerLine = 4;
 
   let ass = `[Script Info]
 Title: ShortsCut Subtitles
@@ -65,33 +72,32 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,${fontSize},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,${outlineSize},1,2,20,20,${marginV},1
+Style: Default,Arial Black,${fontSize},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,${outline},${shadow},2,40,40,${marginV},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `;
 
   for (const seg of segments) {
-    let text = seg.text
-      .replace(/\\/g, "\\\\")
-      .replace(/{/g, "\\{")
-      .replace(/}/g, "\\}");
-
-    const words = text.split(" ");
-    const lines: string[] = [];
-    let currentLine = "";
-    for (const word of words) {
-      if (currentLine.length + word.length + 1 > 30 && currentLine.length > 0) {
-        lines.push(currentLine);
-        currentLine = word;
-      } else {
-        currentLine = currentLine ? `${currentLine} ${word}` : word;
-      }
+    const words = seg.text
+      .replace(/[{}\\]/g, "")
+      .split(/\s+/)
+      .filter((w) => w.length > 0);
+    if (words.length === 0) continue;
+    const groups: string[][] = [];
+    for (let i = 0; i < words.length; i += wordsPerLine) {
+      groups.push(words.slice(i, i + wordsPerLine));
     }
-    if (currentLine) lines.push(currentLine);
-    text = lines.join("\\N");
-
-    ass += `Dialogue: 0,${formatAssTime(seg.start)},${formatAssTime(seg.end)},Default,,0,0,0,,${text}\n`;
+    const segDur = Math.max(0.5, seg.end - seg.start);
+    let t = seg.start;
+    for (const group of groups) {
+      const dur = segDur * (group.length / words.length);
+      let lineEnd = t + dur;
+      if (lineEnd <= t) lineEnd = t + 0.5;
+      const text = group.join(" ").toUpperCase();
+      ass += `Dialogue: 0,${formatAssTime(t)},${formatAssTime(lineEnd)},Default,,0,0,0,,${text}\n`;
+      t = lineEnd;
+    }
   }
 
   return ass;
@@ -122,10 +128,31 @@ export const processJobOnServer = action({
       );
     }
 
-    // Get video download URL
+    // Get video download URL.
+    // NOTE (2026-09-03): the Piped/InnerTube-provided signed googlevideo.com
+    // `videoDownloadUrl` is fragile — even though it's IP-locked to the VPS's
+    // IP, direct curl fetches from the VPS get HTTP 403 (likely needs the
+    // exact request fingerprint used when the URL was minted), which used to
+    // silently save the error body as "source.mp4" and fail ffmpeg with
+    // "moov atom not found". The VPS's own yt-dlp+cookies download (used
+    // successfully for transcripts) is reliable, so always pass youtube_url
+    // and let the VPS prefer that path (`vps/server.py` tries yt-dlp first
+    // for youtube.com URLs, falling back to the direct URL only if yt-dlp
+    // fails).
     const videoUrl = job.videoDownloadUrl;
     const audioUrl = job.audioDownloadUrl || null;
     const youtubeUrl = job.videoUrl;
+
+    const settingsForVps = await ctx.runQuery(
+      internal.processing.getUserSettings,
+      { userId },
+    );
+    const vpsCookies = settingsForVps?.youtubeCookies || undefined;
+    // The VPS transcribes each clip with Whisper (word timestamps, language
+    // auto-detected = original language of the video) and builds the same
+    // 4-words-per-line UPPERCASE Arial Black subtitles as the local script.
+    // The YouTube-caption ASS below is only a fallback if Whisper fails.
+    const vpsOpenaiKey = settingsForVps?.openaiApiKey || undefined;
 
     if (!videoUrl && !youtubeUrl) {
       throw new Error(
@@ -167,7 +194,7 @@ export const processJobOnServer = action({
           ass_subtitles: assContent,
           remove_silence: true,
           crop_plan: null,
-          auto_face_track: true, // VPS runs its own face detection/tracking (vps/face_tracking.py)
+          auto_face_track: true, // VPS runs real MediaPipe face tracking (see PR #1 on the source repo); falls back to center crop automatically if it can't detect a face
         };
       });
 
@@ -188,7 +215,9 @@ export const processJobOnServer = action({
         body: JSON.stringify({
           video_url: videoUrl,
           audio_url: audioUrl,
-          youtube_url: !videoUrl ? youtubeUrl : undefined,
+          youtube_url: youtubeUrl,
+          cookies: vpsCookies,
+          openai_api_key: vpsOpenaiKey,
           clips: clipConfigs,
         }),
         signal: controller.signal,

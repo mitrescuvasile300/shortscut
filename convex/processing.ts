@@ -8,40 +8,56 @@ import {
   internalQuery,
 } from "./_generated/server";
 
-declare const process: { env: Record<string, string | undefined> };
-
-const VIKTOR_API_URL = process.env.VIKTOR_SPACES_API_URL!;
-const PROJECT_NAME = process.env.VIKTOR_SPACES_PROJECT_NAME!;
-const PROJECT_SECRET = process.env.VIKTOR_SPACES_PROJECT_SECRET!;
-
-async function callTool<T>(
-  role: string,
-  args: Record<string, unknown> = {},
-): Promise<T> {
-  const response = await fetch(
-    `${VIKTOR_API_URL}/api/viktor-spaces/tools/call`,
+// --- Direct OpenAI structured-output call (used for AI clip analysis) ---
+// NOTE: the platform's generic tool-call bridge (callTool("ai_structured_output", ...))
+// is NOT a real SDK tool role (only quick_ai_search/text2im/file_to_markdown/MCP tools
+// exist there) and always 500s — confirmed 2026-09-03 by calling
+// `${VIKTOR_SPACES_API_URL}/api/viktor-spaces/tools/call` directly. This app calls
+// OpenAI directly instead (same approach as the Whisper fallback above), using the
+// user's own key from Settings — matches the local pipeline script's model choice.
+async function callOpenAIStructured(
+  apiKey: string,
+  prompt: string,
+  schemaName: string,
+  properties: Record<string, { type: string; description: string }>,
+  required: string[] = [],
+): Promise<Record<string, unknown> | null> {
+  const resp = await fetchWithTimeout(
+    "https://api.openai.com/v1/chat/completions",
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
       body: JSON.stringify({
-        project_name: PROJECT_NAME,
-        project_secret: PROJECT_SECRET,
-        role,
-        arguments: args,
+        model: "gpt-5.4-mini",
+        messages: [{ role: "user", content: prompt }],
+        response_format: {
+          type: "json_schema",
+          json_schema: {
+            name: schemaName,
+            strict: false,
+            schema: { type: "object", properties, required },
+          },
+        },
+        temperature: 0.7,
       }),
+      timeout: 90000,
     },
   );
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`HTTP ${response.status}: ${text}`);
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`OpenAI API error ${resp.status}: ${text.slice(0, 300)}`);
   }
-
-  const json = await response.json();
-  if (!json.success) {
-    throw new Error(json.error ?? "Tool call failed");
+  const json = await resp.json();
+  const content = json.choices?.[0]?.message?.content;
+  if (!content) return null;
+  try {
+    return JSON.parse(content);
+  } catch {
+    return null;
   }
-  return json.result as T;
 }
 
 // --- YouTube oEmbed API (direct fetch, no AI) ---
@@ -1012,14 +1028,17 @@ export const updateJobStatus = internalMutation({
     audioDownloadUrl: v.optional(v.string()),
     videoDownloadExpiry: v.optional(v.number()),
     error: v.optional(v.string()),
+    vpsPipelineId: v.optional(v.string()),
+    clearError: v.optional(v.boolean()),
   },
   returns: v.null(),
   handler: async (ctx, args) => {
-    const { jobId, ...updates } = args;
+    const { jobId, clearError, ...updates } = args;
     const cleanUpdates: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(updates)) {
       if (value !== undefined) cleanUpdates[key] = value;
     }
+    if (clearError) cleanUpdates.error = undefined;
     await ctx.db.patch(jobId, cleanUpdates);
     return null;
   },
@@ -1116,6 +1135,7 @@ async function scanChunkForCandidates(
   targetLang: string,
   minDuration: number,
   maxDuration: number,
+  openaiKey: string,
 ): Promise<CandidateClip[]> {
   const n = CANDIDATES_PER_CHUNK;
   const properties: Record<string, { type: string; description: string }> = {};
@@ -1164,11 +1184,9 @@ async function scanChunkForCandidates(
       "Set to 'true' if this section has NO viral-worthy moments (score >= 5). Otherwise leave empty.",
   };
 
-  const result = await callTool<{
-    result: Record<string, unknown> | null;
-    error: string | null;
-  }>("ai_structured_output", {
-    prompt: `You are scanning SECTION ${chunkIndex + 1} of ${totalChunks} from the podcast "${videoTitle}" by ${videoAuthor}.
+  const data = await callOpenAIStructured(
+    openaiKey,
+    `You are scanning SECTION ${chunkIndex + 1} of ${totalChunks} from the podcast "${videoTitle}" by ${videoAuthor}.
 
 Find up to ${n} potential viral short clips (${minDuration}-${maxDuration}s) in THIS section.
 
@@ -1217,14 +1235,18 @@ Find up to ${n} potential viral short clips (${minDuration}-${maxDuration}s) in 
 
 # TIMESTAMP RULES: Use [MM:SS] or [HH:MM:SS] → convert to total seconds. hookLine = exact sentence from transcript.
 
-# LANGUAGE: titles, reasoning in ${targetLang}. hookLine verbatim from transcript.`,
-    output_schema: { type: "object", properties, required },
-    input_text: chunk,
-    intelligence_level: "smart",
-  });
+# LANGUAGE: titles, reasoning in ${targetLang}. hookLine verbatim from transcript.
 
-  if (result.error || !result.result) return [];
-  const data = result.result;
+# TRANSCRIPT SECTION:
+"""
+${chunk}
+"""`,
+    "clip_candidates",
+    properties,
+    required,
+  );
+
+  if (!data) return [];
   if (String(data["noGoodMoments"]) === "true") return [];
 
   const candidates: CandidateClip[] = [];
@@ -1268,6 +1290,7 @@ async function selectBestClips(
   numShorts: number,
   _minDuration: number,
   _maxDuration: number,
+  openaiKey: string,
 ): Promise<
   Array<{
     title: string;
@@ -1316,23 +1339,28 @@ async function selectBestClips(
     );
   }
 
-  const result = await callTool<{
-    result: Record<string, unknown> | null;
-    error: string | null;
-  }>("ai_structured_output", {
-    prompt: `Select the BEST ${numShorts} clips from ${candidates.length} candidates for "${videoTitle}" by ${videoAuthor}.
+  let data: Record<string, unknown> | null = null;
+  try {
+    data = await callOpenAIStructured(
+      openaiKey,
+      `Select the BEST ${numShorts} clips from ${candidates.length} candidates for "${videoTitle}" by ${videoAuthor}.
 Consider: VARIETY, QUALITY, NO OVERLAP, BEST HOOKS, HUMOR, REVERSALS, CONTROVERSY.
 TITLE: 5-8 words, curiosity gap, power words, no spoilers.
 SCORING: Be honest. Most 6-8, max 1 at 9-10. All text in ${targetLang}.
 
 Candidates:
 ${candidateSummary}`,
-    output_schema: { type: "object", properties, required },
-    input_text: candidateSummary,
-    intelligence_level: "smart",
-  });
+      "best_clips",
+      properties,
+      required,
+    );
+  } catch (err) {
+    console.log(
+      `[selectBestClips] OpenAI call failed, falling back to score sort: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
 
-  if (result.error || !result.result) {
+  if (!data) {
     const sorted = [...candidates].sort((a, b) => b.viralScore - a.viralScore);
     return sorted.slice(0, numShorts).map(c => ({
       title: c.title,
@@ -1349,7 +1377,6 @@ ${candidateSummary}`,
     }));
   }
 
-  const data = result.result;
   const finalClips: Array<{
     title: string;
     description: string;
@@ -1492,6 +1519,7 @@ async function analyzeTranscriptWithAI(
   numShorts: number,
   minDuration: number,
   maxDuration: number,
+  openaiKey: string,
 ): Promise<
   Array<{
     title: string;
@@ -1531,6 +1559,7 @@ async function analyzeTranscriptWithAI(
       targetLang,
       minDuration,
       maxDuration,
+      openaiKey,
     );
     allCandidates.push(...candidates);
   }
@@ -1567,6 +1596,7 @@ async function analyzeTranscriptWithAI(
     numShorts,
     minDuration,
     maxDuration,
+    openaiKey,
   );
   return correctTimestamps(transcript, finalClips);
 }
@@ -1783,8 +1813,13 @@ export const processJob = action({
       });
 
       // ===== STEP 3: AI analysis =====
+      if (!openaiKey) {
+        throw new Error(
+          "Setează OpenAI API Key în Settings pentru analiza AI a clipurilor.",
+        );
+      }
       const videoAuthor = piped ? piped.title.split(" - ")[0] : "Unknown";
-      const clips = await analyzeTranscriptWithAI(
+      let clips = await analyzeTranscriptWithAI(
         transcriptResult.text,
         videoTitle,
         videoAuthor,
@@ -1792,7 +1827,22 @@ export const processJob = action({
         job.numShorts,
         job.minDuration,
         job.maxDuration,
+        openaiKey,
       );
+
+      // Safety net: the AI can occasionally hallucinate a timestamp beyond
+      // the actual video length (seen 2026-09-03 — ffmpeg then silently
+      // produces a 0-byte clip instead of erroring). Clamp to the transcript's
+      // last known timestamp and drop anything that still starts past it.
+      const maxKnownTime = transcriptResult.segments.length
+        ? Math.max(...transcriptResult.segments.map(s => s.end))
+        : Infinity;
+      clips = clips
+        .filter(c => c.startTime < maxKnownTime)
+        .map(c => ({
+          ...c,
+          endTime: Math.min(c.endTime, maxKnownTime),
+        }));
 
       if (clips.length === 0) {
         throw new Error(
@@ -1978,6 +2028,15 @@ export const analyzeTranscript = internalAction({
         transcript: `[Source: whisper]\n${transcript.substring(0, 49000)}`,
       });
 
+      const settings = await ctx.runQuery(internal.processing.getUserSettings, {
+        userId: jobData.userId,
+      });
+      if (!settings?.openaiApiKey) {
+        throw new Error(
+          "Setează OpenAI API Key în Settings pentru analiza AI a clipurilor.",
+        );
+      }
+
       const clips = await analyzeTranscriptWithAI(
         transcript,
         jobData.videoTitle || "Unknown Video",
@@ -1986,6 +2045,7 @@ export const analyzeTranscript = internalAction({
         jobData.numShorts,
         jobData.minDuration,
         jobData.maxDuration,
+        settings.openaiApiKey,
       );
 
       if (clips.length === 0) {

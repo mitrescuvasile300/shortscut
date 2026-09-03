@@ -794,7 +794,54 @@ def log(msg):
 # "two people simultaneously visible" (real dual-mode).
 results = [None] * len(frame_paths)
 
-# ── METHOD 1: MediaPipe Tasks API ──
+# ── METHOD 1: OpenCV YuNet (full-resolution, finds SMALL faces) ──
+# BlazeFace short-range downsamples the whole frame to 128×128, so in a wide
+# podcast two-shot (each face ≈ 40 px at 720p) it misses one or both
+# speakers → the clip fell back to a center crop between the two people.
+# YuNet runs at native resolution and finds both faces at ~0.9 confidence.
+yn_count = 0
+try:
+    import cv2
+    YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+    yunet_path = "/tmp/face_detection_yunet_2023mar.onnx"
+    if not os.path.exists(yunet_path) or os.path.getsize(yunet_path) < 100_000:
+        log("Downloading YuNet model...")
+        urllib.request.urlretrieve(YUNET_URL, yunet_path)
+    yunet = cv2.FaceDetectorYN.create(yunet_path, "", (320, 320), 0.6, 0.3, 5000)
+    for idx, fp in enumerate(frame_paths):
+        img = cv2.imread(fp)
+        if img is None:
+            continue
+        h_img, w_img = img.shape[:2]
+        yunet.setInputSize((w_img, h_img))
+        _, faces = yunet.detect(img)
+        if faces is None or len(faces) == 0:
+            continue
+        min_face_px = max(24, int(w_img * 0.02))
+        frame_faces = []
+        for f in faces:
+            x, y, fw, fh = float(f[0]), float(f[1]), float(f[2]), float(f[3])
+            if fw < min_face_px or fh < min_face_px:
+                continue
+            # landmarks: 4,5 right eye · 6,7 left eye · 8,9 nose tip · 10-13 mouth
+            nose_x, nose_y = float(f[8]), float(f[9])
+            if not (x <= nose_x <= x + fw):
+                nose_x, nose_y = x + fw / 2.0, y + fh / 2.0
+            frame_faces.append({{
+                "x": nose_x / w_img,
+                "y": nose_y / h_img,
+                "w": fw / w_img,
+                "h": fh / h_img,
+                "score": float(f[14]),
+            }})
+        if frame_faces:
+            results[idx] = frame_faces
+            yn_count += 1
+    log(f"YuNet: {{yn_count}}/{{len(frame_paths)}} frames")
+except Exception as e:
+    log(f"YuNet error: {{e}}")
+
+# ── METHOD 1b: MediaPipe Tasks API (frames YuNet missed) ──
 # The legacy `mp.solutions.face_detection` was removed in recent mediapipe
 # builds (the user's environment shows: "module 'mediapipe' has no attribute
 # 'solutions'"). The current API is `mediapipe.tasks.python.vision`, which
@@ -823,6 +870,8 @@ try:
     log(f"MediaPipe Tasks {{mp.__version__}} + OpenCV {{cv2.__version__}}, {{len(frame_paths)}} frames")
 
     for idx, fp in enumerate(frame_paths):
+        if results[idx] is not None:
+            continue
         img_bgr = cv2.imread(fp)
         if img_bgr is None:
             continue
@@ -838,7 +887,7 @@ try:
         # width, height). Keypoints are NormalizedKeypoint in [0,1].
         # Keypoint order for BlazeFace: 0=left eye, 1=right eye, 2=nose tip,
         # 3=mouth, 4=left ear tragion, 5=right ear tragion.
-        min_face_px = max(40, int(w_img * 0.04))
+        min_face_px = max(24, int(w_img * 0.02))
         for d in res.detections:
             bb = d.bounding_box
             if bb.width < min_face_px or bb.height < min_face_px:
@@ -870,9 +919,9 @@ except Exception as e:
     log(traceback.format_exc().replace(chr(10), ' | '))
 
 # ── METHOD 2: Haar cascade fallback for frames where MP failed ──
-# Tightened minSize from 3% to 8% of frame width — at 3%, Haar caught
-# audience members in stand-up footage, leading to spurious dual detection.
-# 8% of 1920 = 154 px; that's about a face at ~3m, which is what we want.
+# minSize 5% of frame width: 3% caught audience members in stand-up footage,
+# 8% missed both speakers in wide podcast two-shots. Spurious extra faces are
+# handled downstream by the dual-mode Y/size constraints.
 haar_count = 0
 try:
     import cv2
@@ -888,7 +937,7 @@ try:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             gray = cv2.equalizeHist(gray)
             h_img, w_img = gray.shape
-            min_face = max(80, int(w_img * 0.08))
+            min_face = max(48, int(w_img * 0.05))
             faces = face_cascade.detectMultiScale(
                 gray, 1.1, 4, minSize=(min_face, min_face)
             )
@@ -915,7 +964,7 @@ except Exception as e:
 
 detected = sum(1 for r in results if r is not None)
 log(f"Total: {{detected}}/{{len(results)}} frames with faces")
-print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count}}))
+print(json.dumps({{"results": results, "yunet": yn_count, "mp": mp_count, "haar": haar_count}}))
 """)
 
     r = subprocess.run(
@@ -941,14 +990,118 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count}}))
     raw = data.get("results", [])
     n = len(raw)
     n_detected = sum(1 for r in raw if r is not None and len(r) > 0)
-
     if n_detected < 2:
         print(f"    ⚠️  Only {n_detected} face detections — using center")
         return {"mode": "center", "crop_x": (src_w - crop_w) // 2}
 
     fps_sample = extract_fps
     dt = 1.0 / fps_sample
+
+    # ── Camera shots ─────────────────────────────────────────────────
+    # Podcasts cut between a wide two-shot and single close-ups every few
+    # seconds. One framing decision for the whole clip is wrong for most of
+    # it (a center crop of a two-shot shows the table and half of each
+    # person). So: detect the cuts, decide the framing PER SHOT, and let
+    # generate_shorts() switch layouts at every cut.
+    cuts = detect_scene_cuts(video_path, start_time, duration)
+    bounds = [0.0] + [c for c in cuts if 0.0 < c < duration] + [duration]
+    shots: list[tuple[float, float]] = []
+    for a, b in zip(bounds, bounds[1:]):
+        if shots and (b - a) < 1.0:       # merge sub-second flashes into the previous shot
+            shots[-1] = (shots[-1][0], b)
+        else:
+            shots.append((a, b))
+    if len(shots) > 1 and (shots[0][1] - shots[0][0]) < 1.0:
+        shots[1] = (shots[0][0], shots[1][1])
+        shots.pop(0)
+
+    if len(shots) == 1:
+        return _plan_crop_for_frames(raw, fps_sample, src_w, crop_w)
+
+    print(f"    🎬 {len(shots)} camera shots detected")
+    segments = []
+    for (s0, s1) in shots:
+        i0 = int(math.floor(s0 * fps_sample))
+        i1 = max(i0 + 1, int(math.ceil(s1 * fps_sample)))
+        sub = raw[i0:min(i1, n)]
+        if not sub:
+            plan = {"mode": "center", "crop_x": (src_w - crop_w) // 2}
+        else:
+            # Within one shot a two-person framing is stable, so 60% of the
+            # face-frames showing both people is enough to call it dual.
+            plan = _plan_crop_for_frames(sub, fps_sample, src_w, crop_w, dual_consistency=0.6)
+        if plan["mode"] == "tracking":
+            plan["keyframes"] = [(round(t + s0, 2), x) for (t, x) in plan["keyframes"]]
+        seg = {"start": round(s0, 3), "end": round(s1, 3), **plan}
+        # Merge with the previous shot when the framing is effectively the same
+        if segments and _same_framing(segments[-1], seg):
+            segments[-1]["end"] = seg["end"]
+        else:
+            segments.append(seg)
+
+    if len(segments) == 1:
+        seg = segments[0]
+        return {k: v for k, v in seg.items() if k not in ("start", "end")}
+    modes = ", ".join(f"{s['mode']}@{s['start']:.1f}s" for s in segments)
+    print(f"    🎬 Multi-shot framing: {modes}")
+    return {"mode": "multi", "segments": segments}
+
+
+def _same_framing(a: dict, b: dict) -> bool:
+    if a["mode"] != b["mode"]:
+        return False
+    if a["mode"] in ("single", "center"):
+        return abs(a.get("crop_x", 0) - b.get("crop_x", 0)) < 25
+    if a["mode"] == "dual":
+        return abs(a["face1_x"] - b["face1_x"]) < 0.03 and abs(a["face2_x"] - b["face2_x"]) < 0.03
+    return False  # tracking segments are kept separate (their keyframes differ)
+
+
+def detect_scene_cuts(video_path: Path, start_time: float, duration: float,
+                      threshold: float = 0.30) -> list[float]:
+    """Return clip-relative timestamps of hard camera cuts (ffmpeg scene score)."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-ss", str(start_time), "-t", str(duration),
+        "-i", str(video_path),
+        "-vf", f"scale=320:-2,select='gt(scene,{threshold})',showinfo",
+        "-an", "-f", "null", "-",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    except Exception:
+        return []
+    cuts = []
+    for m in re.finditer(r"pts_time:\s*([\d.]+)", r.stderr):
+        t = float(m.group(1))
+        if not cuts or t - cuts[-1] > 0.3:
+            cuts.append(round(t, 3))
+    return cuts
+
+
+def _plan_crop_for_frames(raw: list, fps_sample: float, src_w: int, crop_w: int,
+                          dual_consistency: float = 0.85) -> dict:
+    """Decide the 9:16 framing for ONE camera shot from its per-frame face lists.
+
+    raw: list (one entry per sampled frame) of face lists [{x,y,w,h,score}] or None.
+    Returns {"mode": "center"|"single"|"dual"|"tracking", ...}; tracking
+    keyframe times are relative to the first frame of `raw`.
+    """
+    n = len(raw)
+    n_detected = sum(1 for r in raw if r is not None and len(r) > 0)
     max_crop_x = src_w - crop_w
+    dt = 1.0 / fps_sample
+
+    if n_detected == 0:
+        print(f"    ⚠️  No face detections — using center")
+        return {"mode": "center", "crop_x": max_crop_x // 2}
+    if n_detected == 1:
+        # One usable frame: frame the biggest face statically.
+        faces = next(r for r in raw if r)
+        f = max(faces, key=lambda f: f["w"] * f["h"])
+        cx = int(f["x"] * src_w - crop_w * 0.45)
+        cx = max(0, min(cx, max_crop_x))
+        print(f"    📷 Single detection → static crop (x={cx})")
+        return {"mode": "single", "crop_x": cx}
 
     # ──────────────────────────────────────────────────────────────────
     #  Step 1: DUAL DETECTION (strict — two real speakers, side by side)
@@ -966,7 +1119,6 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count}}))
     min_sep_norm = (crop_w * 0.8) / src_w   # 0.253 on 1920×1080
     y_tolerance = 0.25
     size_ratio_max = 2.0
-    dual_consistency = 0.85
 
     frames_with_any = 0
     frames_with_valid_dual = 0
@@ -1004,7 +1156,7 @@ print(json.dumps({{"results": results, "mp": mp_count, "haar": haar_count}}))
     if (
         frames_with_any > 0
         and frames_with_valid_dual / frames_with_any >= dual_consistency
-        and len(valid_lefts) >= 3
+        and len(valid_lefts) >= (3 if dual_consistency >= 0.85 else 2)
     ):
         f1 = statistics.median(valid_lefts)
         f2 = statistics.median(valid_rights)
@@ -1561,6 +1713,99 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return ass
 
 
+def _face_layout_segments(face_info: dict, dur: float) -> list[tuple[float, float, dict]]:
+    """Normalize a detect_faces_for_clip() result to [(start, end, layout), ...]."""
+    if face_info.get("mode") == "multi":
+        out = []
+        for seg in face_info["segments"]:
+            layout = {k: v for k, v in seg.items() if k not in ("start", "end")}
+            out.append((float(seg["start"]), float(seg["end"]), layout))
+        if out:
+            out[0] = (0.0, out[0][1], out[0][2])
+            out[-1] = (out[-1][0], float(dur), out[-1][2])
+        return out
+    return [(0.0, float(dur), face_info)]
+
+
+def _build_layout_pieces(time_segs: list[tuple[float, float, float]], face_info: dict,
+                         dur: float) -> list[tuple[float, float, dict]]:
+    """Intersect kept (speaking) time ranges with per-shot framings.
+
+    time_segs: [(srcStart, srcEnd, outStart)] from build_speaking_segments, or
+    one tuple covering the whole clip. Returns [(srcStart, srcEnd, layout)].
+    Pieces shorter than 80 ms are merged into their neighbour so ffmpeg never
+    gets an empty trim.
+    """
+    layouts = _face_layout_segments(face_info, dur)
+    pieces: list[tuple[float, float, dict]] = []
+    for (ts, te, _out) in time_segs:
+        for (ls, le, layout) in layouts:
+            a, b = max(ts, ls), min(te, le)
+            if b - a <= 0:
+                continue
+            if b - a < 0.08 and pieces and abs(pieces[-1][1] - a) < 1e-6:
+                pieces[-1] = (pieces[-1][0], b, pieces[-1][2])
+            else:
+                pieces.append((a, b, layout))
+    # Merge adjacent pieces with identical framing (fewer trims, same result)
+    merged: list[tuple[float, float, dict]] = []
+    for pc in pieces:
+        if merged and abs(merged[-1][1] - pc[0]) < 1e-6 and _layout_key(merged[-1][2]) == _layout_key(pc[2]):
+            merged[-1] = (merged[-1][0], pc[1], merged[-1][2])
+        else:
+            merged.append(pc)
+    return merged or [(0.0, float(dur), face_info)]
+
+
+def _layout_key(layout: dict) -> tuple:
+    mode = layout.get("mode", "center")
+    if mode == "dual":
+        return ("dual", round(layout["face1_x"], 3), round(layout["face2_x"], 3))
+    if mode == "tracking":
+        return ("tracking", id(layout))
+    return (mode, layout.get("crop_x"))
+
+
+def _layout_filter(in_label: str, out_label: str, layout: dict, t_offset: float,
+                   src_w: int, src_h: int, crop_w: int, out_w: int, out_h: int) -> str:
+    """ffmpeg filter-graph fragment mapping [in_label] → [out_label] for one framing.
+
+    t_offset is the clip-relative time at which this piece starts (after a
+    trim+setpts the piece's own clock restarts at 0, so tracking keyframes
+    are shifted by it).
+    """
+    crop_h = src_h
+    max_crop_x = src_w - crop_w
+    mode = layout.get("mode", "center")
+
+    if mode == "dual":
+        # Split-screen: person 1 in the top half, person 2 in the bottom half.
+        # Each half is out_w × out_h/2 (9:8), so crop a 9:8 window around each
+        # face — NOT the 9:16 crop_w, which would squash the faces when scaled.
+        half_h = out_h // 2
+        dual_crop_w = min(src_w, int(src_h * 9 / 8))
+        cx1 = int(layout["face1_x"] * src_w - dual_crop_w / 2)
+        cx2 = int(layout["face2_x"] * src_w - dual_crop_w / 2)
+        cx1 = max(0, min(cx1, src_w - dual_crop_w))
+        cx2 = max(0, min(cx2, src_w - dual_crop_w))
+        return (
+            f"[{in_label}]split=2[{out_label}_t][{out_label}_b];"
+            f"[{out_label}_t]crop={dual_crop_w}:{crop_h}:{cx1}:0,scale={out_w}:{half_h}[{out_label}_tc];"
+            f"[{out_label}_b]crop={dual_crop_w}:{crop_h}:{cx2}:0,scale={out_w}:{half_h}[{out_label}_bc];"
+            f"[{out_label}_tc][{out_label}_bc]vstack=inputs=2,setsar=1[{out_label}]"
+        )
+
+    if mode == "tracking":
+        kfs = [(max(0.0, t - t_offset), x) for (t, x) in layout["keyframes"]]
+        expr = build_tracking_crop_expr(kfs, max_crop_x)
+        return f"[{in_label}]crop={crop_w}:{crop_h}:{expr}:0,scale={out_w}:{out_h},setsar=1[{out_label}]"
+
+    crop_x = layout.get("crop_x", max_crop_x // 2)
+    crop_x = max(0, min(int(crop_x), max_crop_x))
+    # setsar=1: every piece must have identical SAR or concat refuses to join them
+    return f"[{in_label}]crop={crop_w}:{crop_h}:{crop_x}:0,scale={out_w}:{out_h},setsar=1[{out_label}]"
+
+
 def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
                     output_dir: Path, python_path: str,
                     skip_face: bool = False) -> list[Path]:
@@ -1602,7 +1847,10 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
                 clip["startTime"], dur, src_w, src_h, crop_w,
             )
             face_results.append(result)
-            if result["mode"] == "dual":
+            if result["mode"] == "multi":
+                n_dual = sum(1 for sg in result["segments"] if sg["mode"] == "dual")
+                print(f" 🎬 {len(result['segments'])} shots ({n_dual} split-screen)")
+            elif result["mode"] == "dual":
                 print(f" 👥 TWO faces → split-screen")
             elif result["mode"] == "tracking":
                 nk = len(result["keyframes"])
@@ -1680,189 +1928,87 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
                    .replace("[", "\\[")
                    .replace("]", "\\]"))
 
-        is_dual = face_info["mode"] == "dual"
-        is_tracking = face_info["mode"] == "tracking"
+        # ── Layout pieces ───────────────────────────────────────────
+        # The clip timeline is cut into pieces at (a) silence-removal
+        # boundaries and (b) camera-shot boundaries with a different framing
+        # (single ↔ dual split-screen ↔ tracking). Every piece gets its own
+        # crop/scale chain and the pieces are concatenated. Subtitles are
+        # burned after the concat, on the final timeline.
+        time_segs = speaking_segs or [(0.0, float(dur), 0.0)]
+        pieces = _build_layout_pieces(time_segs, face_info, dur)
+        n_layouts = len({_layout_key(pc[2]) for pc in pieces})
+        if n_layouts > 1:
+            print(f"     🎬 {n_layouts} framings across {len(pieces)} pieces")
 
-        if is_dual:
-            # ── SPLIT-SCREEN: two faces stacked vertically ──
-            f1_x = face_info["face1_x"]  # normalized 0-1
-            f2_x = face_info["face2_x"]  # normalized 0-1
-
-            # FIX: Each half-screen is 1080x960 = aspect 9:8, NOT 9:16!
-            # Using crop_w (9:16) would squish faces ~180% when scaling.
-            half_h = out_h // 2  # 960
-            dual_crop_w = min(src_w, int(src_h * 9 / 8))
-            cx1 = int(f1_x * src_w - dual_crop_w / 2)
-            cx1 = max(0, min(cx1, src_w - dual_crop_w))
-            cx2 = int(f2_x * src_w - dual_crop_w / 2)
-            cx2 = max(0, min(cx2, src_w - dual_crop_w))
-            print(f"     👥 Split-screen: face1@{cx1}, face2@{cx2} (dual_crop_w={dual_crop_w})")
-        elif is_tracking:
-            # ── DYNAMIC FACE TRACKING ──
-            tracking_expr = build_tracking_crop_expr(
-                face_info["keyframes"], src_w - crop_w)
-            print(f"     📹 Dynamic crop: {len(face_info['keyframes'])} keyframes")
-        else:
-            crop_x = face_info.get("crop_x", (src_w - crop_w) // 2)
-
-        # ── Build ffmpeg command with subtitle burning ──
-        # Try ass= filter first, then subtitles= filter, then no subs
         success = False
-
-        # ── SILENCE REMOVAL PATH ─────────────────────────────────
-        # When speaking_segs is set, build a combined filter_complex
-        # that trims out silence + applies crop + concats segments.
-        if speaking_segs and not success:
-            n_segs = len(speaking_segs)
-            for sub_filter_name in ["ass", "subtitles", None]:
-                if success:
-                    break
-                fc_parts: list[str] = []
-                vs = "".join(f"[v{j}]" for j in range(n_segs))
-                asa = "".join(f"[a{j}]" for j in range(n_segs))
-                fc_parts.append(f"[0:v]split={n_segs}{vs}")
-                fc_parts.append(f"[0:a]asplit={n_segs}{asa}")
-
-                for j, (seg_s, seg_e, _seg_out) in enumerate(speaking_segs):
-                    mid_t = (seg_s + seg_e) / 2
-                    if is_dual:
-                        dual_crop_w2 = min(src_w, int(src_h * 9 / 8))
-                        half_h2 = out_h // 2
-                        cx1b = max(0, min(int(face_info["face1_x"] * src_w - dual_crop_w2 / 2), src_w - dual_crop_w2))
-                        cx2b = max(0, min(int(face_info["face2_x"] * src_w - dual_crop_w2 / 2), src_w - dual_crop_w2))
-                        fc_parts.append(
-                            f"[v{j}]trim=start={seg_s:.3f}:end={seg_e:.3f},setpts=PTS-STARTPTS,"
-                            f"split=2[v{j}t][v{j}b]"
-                        )
-                        fc_parts.append(f"[v{j}t]crop={dual_crop_w2}:{crop_h}:{cx1b}:0,scale={out_w}:{half_h2}[v{j}tc]")
-                        fc_parts.append(f"[v{j}b]crop={dual_crop_w2}:{crop_h}:{cx2b}:0,scale={out_w}:{half_h2}[v{j}bc]")
-                        fc_parts.append(f"[v{j}tc][v{j}bc]vstack=inputs=2[vo{j}]")
-                    else:
-                        cx = get_crop_x_at_time(face_info, mid_t, src_w, crop_w)
-                        fc_parts.append(
-                            f"[v{j}]trim=start={seg_s:.3f}:end={seg_e:.3f},setpts=PTS-STARTPTS,"
-                            f"crop={crop_w}:{crop_h}:{cx}:0,scale={out_w}:{out_h}[vo{j}]"
-                        )
-                    fc_parts.append(
-                        f"[a{j}]atrim=start={seg_s:.3f}:end={seg_e:.3f},asetpts=PTS-STARTPTS[ao{j}]"
-                    )
-
-                concat_in = "".join(f"[vo{j}][ao{j}]" for j in range(n_segs))
-                fc_parts.append(f"{concat_in}concat=n={n_segs}:v=1:a=1[cv][ca]")
-
-                if sub_filter_name:
-                    fc_parts.append(f"[cv]{sub_filter_name}={ass_esc}[fv]")
-                    v_label, a_label = "[fv]", "[ca]"
-                else:
-                    v_label, a_label = "[cv]", "[ca]"
-
-                vf = ";".join(fc_parts)
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-ss", str(start), "-i", str(video_path), "-t", str(dur),
-                    "-filter_complex", vf,
-                    "-map", v_label, "-map", a_label,
-                    "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart",
-                    str(output_file),
-                ]
-                label = f"[{sub_filter_name}+silence_rm]" if sub_filter_name else "[silence_rm, no subs]"
-                try:
-                    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-                    if proc.returncode != 0:
-                        raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=proc.stderr)
-                    size_mb = output_file.stat().st_size / (1024 * 1024)
-                    print(f"     ✅ {output_file.name} ({size_mb:.1f} MB) {label}")
-                    output_files.append(output_file)
-                    success = True
-                except subprocess.CalledProcessError as e:
-                    stderr_msg = getattr(e, 'stderr', '') or ''
-                    if stderr_msg:
-                        err_lines = [l for l in stderr_msg.strip().split('\n') if l.strip()][-2:]
-                        for el in err_lines:
-                            print(f"     ⚠️  {el.strip()}")
-                    if sub_filter_name == "ass":
-                        print(f"     ⚠️  ass+silence_rm failed, trying subtitles filter...")
-                    elif sub_filter_name == "subtitles":
-                        print(f"     ⚠️  subtitles+silence_rm failed, trying without subs...")
-                    else:
-                        print(f"     ⚠️  silence_rm failed entirely, falling back to normal pipeline...")
-                        speaking_segs = None  # fall through to normal path
-
+        simple = (
+            len(pieces) == 1
+            and abs(pieces[0][0]) < 1e-6
+            and abs(pieces[0][1] - dur) < 1e-6
+        )
         for sub_filter_name in ["ass", "subtitles", None]:
             if success:
                 break
+            label = f"[{sub_filter_name}]" if sub_filter_name else "[no subs]"
+            if speaking_segs:
+                label = label[:-1] + "+silence_rm]"
 
-            if is_dual:
-                base_filter = (
-                    f"[0:v]split=2[top][bot];"
-                    f"[top]crop={dual_crop_w}:{crop_h}:{cx1}:0,scale={out_w}:{half_h}[t];"
-                    f"[bot]crop={dual_crop_w}:{crop_h}:{cx2}:0,scale={out_w}:{half_h}[b];"
-                    f"[t][b]vstack[stacked]"
-                )
+            if simple:
+                # One framing, full clip: same single-input command as before
+                layout = pieces[0][2]
+                fc = _layout_filter("0:v", "v", layout, 0.0, src_w, src_h, crop_w, out_w, out_h)
                 if sub_filter_name:
-                    vf = f"{base_filter};[stacked]{sub_filter_name}={ass_esc}[v]"
+                    fc += f";[v]{sub_filter_name}={ass_esc}[vout]"
+                    v_label = "[vout]"
                 else:
-                    vf = (
-                        f"[0:v]split=2[top][bot];"
-                        f"[top]crop={dual_crop_w}:{crop_h}:{cx1}:0,scale={out_w}:{half_h}[t];"
-                        f"[bot]crop={dual_crop_w}:{crop_h}:{cx2}:0,scale={out_w}:{half_h}[b];"
-                        f"[t][b]vstack[v]"
-                    )
-
+                    v_label = "[v]"
                 cmd = [
                     "ffmpeg", "-y",
                     "-ss", str(start), "-i", str(video_path), "-t", str(dur),
-                    "-filter_complex", vf,
-                    "-map", "[v]", "-map", "0:a",
-                    "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart",
-                    str(output_file),
-                ]
-            elif is_tracking:
-                # Dynamic face-following crop — expression-based crop x
-                crop_filter = f"crop={crop_w}:{crop_h}:{tracking_expr}:0,scale={out_w}:{out_h}"
-                if sub_filter_name:
-                    vf = f"{crop_filter},{sub_filter_name}={ass_esc}"
-                else:
-                    vf = crop_filter
-
-                cmd = [
-                    "ffmpeg", "-y",
-                    "-ss", str(start), "-i", str(video_path), "-t", str(dur),
-                    "-vf", vf,
-                    "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart",
-                    str(output_file),
+                    "-filter_complex", fc,
+                    "-map", v_label, "-map", "0:a?",
                 ]
             else:
-                # Single/center mode — static crop
-                crop_filter = f"crop={crop_w}:{crop_h}:{crop_x}:0,scale={out_w}:{out_h}"
+                n_p = len(pieces)
+                vs = "".join(f"[v{j}]" for j in range(n_p))
+                asa = "".join(f"[a{j}]" for j in range(n_p))
+                fc_parts = [f"[0:v]split={n_p}{vs}", f"[0:a]asplit={n_p}{asa}"]
+                for j, (seg_s, seg_e, layout) in enumerate(pieces):
+                    fc_parts.append(
+                        f"[v{j}]trim=start={seg_s:.3f}:end={seg_e:.3f},setpts=PTS-STARTPTS[v{j}t]"
+                    )
+                    fc_parts.append(
+                        _layout_filter(f"v{j}t", f"vo{j}", layout, seg_s, src_w, src_h, crop_w, out_w, out_h)
+                    )
+                    fc_parts.append(
+                        f"[a{j}]atrim=start={seg_s:.3f}:end={seg_e:.3f},asetpts=PTS-STARTPTS[ao{j}]"
+                    )
+                concat_in = "".join(f"[vo{j}][ao{j}]" for j in range(n_p))
+                fc_parts.append(f"{concat_in}concat=n={n_p}:v=1:a=1[cv][ca]")
                 if sub_filter_name:
-                    vf = f"{crop_filter},{sub_filter_name}={ass_esc}"
+                    fc_parts.append(f"[cv]{sub_filter_name}={ass_esc}[fv]")
+                    v_label = "[fv]"
                 else:
-                    vf = crop_filter
-
+                    v_label = "[cv]"
                 cmd = [
                     "ffmpeg", "-y",
                     "-ss", str(start), "-i", str(video_path), "-t", str(dur),
-                    "-vf", vf,
-                    "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart",
-                    str(output_file),
+                    "-filter_complex", ";".join(fc_parts),
+                    "-map", v_label, "-map", "[ca]",
                 ]
 
-            label = f"[{sub_filter_name}]" if sub_filter_name else "[no subs]"
+            cmd += [
+                "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                str(output_file),
+            ]
             try:
                 proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
                 if proc.returncode != 0:
                     raise subprocess.CalledProcessError(proc.returncode, cmd, stderr=proc.stderr)
                 size_mb = output_file.stat().st_size / (1024 * 1024)
-                suffix = "" if sub_filter_name == "ass" else f" {label}"
+                suffix = "" if sub_filter_name == "ass" and not speaking_segs else f" {label}"
                 print(f"     ✅ {output_file.name} ({size_mb:.1f} MB){suffix}")
                 output_files.append(output_file)
                 success = True
@@ -1883,12 +2029,15 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
 
 
 # ─────────────────────────── main ────────────────────────────────
-def get_video_title(url: str) -> str:
-    """Get video title via yt-dlp."""
+def get_video_title(url: str, cookies_file: str | None = None) -> str:
+    """Get video title via yt-dlp (uses the same cookies as the download, if any)."""
     try:
+        cmd = ["yt-dlp", "--get-title", "--no-playlist"]
+        if cookies_file:
+            cmd.extend(["--cookies", cookies_file])
+        cmd.append(url)
         result = subprocess.run(
-            ["yt-dlp", "--get-title", "--no-playlist", url],
-            capture_output=True, text=True, timeout=30,
+            cmd, capture_output=True, text=True, timeout=30,
         )
         return result.stdout.strip() or "Podcast"
     except Exception:
@@ -1950,7 +2099,7 @@ def main():
     # Get video title
     if is_youtube:
         print(f"\n📋 Fetching video info...")
-        video_title = get_video_title(args.source)
+        video_title = get_video_title(args.source, args.cookies)
     else:
         video_title = Path(args.source).stem.replace("_", " ").replace("-", " ").title()
     print(f"   Title: {video_title}")

@@ -33,6 +33,7 @@ export const list = query({
       audioDownloadUrl: v.optional(v.string()),
       videoDownloadExpiry: v.optional(v.number()),
       error: v.optional(v.string()),
+      vpsPipelineId: v.optional(v.string()),
     })
   ),
   handler: async (ctx) => {
@@ -77,6 +78,7 @@ export const get = query({
       audioDownloadUrl: v.optional(v.string()),
       videoDownloadExpiry: v.optional(v.number()),
       error: v.optional(v.string()),
+      vpsPipelineId: v.optional(v.string()),
     }),
     v.null()
   ),

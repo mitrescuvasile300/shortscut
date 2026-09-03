@@ -43,6 +43,7 @@ const schema = defineSchema({
     audioDownloadUrl: v.optional(v.string()), // Direct download URL (audio-only, for muxing)
     videoDownloadExpiry: v.optional(v.number()), // Expiry timestamp
     error: v.optional(v.string()),
+    vpsPipelineId: v.optional(v.string()), // set when the job runs the full script on the VPS
   })
     .index("by_userId", ["userId"])
     .index("by_status", ["status"]),

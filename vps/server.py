@@ -21,6 +21,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 import face_tracking
 import whisper_subtitles
+import pipeline_runner
 
 # ── Config ────────────────────────────────────────────────────────────
 API_KEY = os.environ.get("SHORTSCUT_API_KEY", "shortcut-vps-2026")
@@ -843,6 +844,39 @@ class Handler(BaseHTTPRequestHandler):
                 pass
             return
 
+        # Full local-script pipeline: status + files
+        if self.path.startswith("/pipeline/"):
+            parts = self.path.split("?")[0].strip("/").split("/")
+            # /pipeline/<id>
+            if len(parts) == 2:
+                if not self._check_auth():
+                    return
+                st = pipeline_runner.status(parts[1])
+                if not st:
+                    self._json_response(404, {"error": "Pipeline not found"})
+                    return
+                self._json_response(200, st)
+                return
+            # /pipeline/<id>/file/<name>
+            if len(parts) == 4 and parts[2] == "file":
+                from urllib.parse import unquote
+                fp = pipeline_runner.file_path(parts[1], unquote(parts[3]))
+                if not fp:
+                    self._json_response(404, {"error": "File not found"})
+                    return
+                size = fp.stat().st_size
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f'attachment; filename="{fp.name}"')
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                with open(fp, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile)
+                return
+            self._json_response(404, {"error": "Not found"})
+            return
+
         # Download processed file
         if self.path.startswith("/download/"):
             file_id = self.path.split("/download/")[1]
@@ -912,6 +946,36 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         # Process a full job (download + all clips)
+        # Run the exact local script (shortscut_pipeline.py) end-to-end.
+        # Body: youtube_url, openai_api_key, language, num_shorts,
+        #       min_duration, max_duration, cookies (optional)
+        if self.path == "/pipeline":
+            try:
+                body = json.loads(self._read_body())
+                url = body.get("youtube_url") or body.get("video_url")
+                key = body.get("openai_api_key")
+                if not url or not key:
+                    self._json_response(400, {"error": "youtube_url and openai_api_key are required"})
+                    return
+                pipeline_runner.cleanup()
+                ensure_work_dir()
+                pid = pipeline_runner.start(
+                    WORK_DIR,
+                    youtube_url=url,
+                    api_key=key,
+                    language=body.get("language") or "en",
+                    num_shorts=int(body.get("num_shorts") or 5),
+                    min_duration=int(body.get("min_duration") or 30),
+                    max_duration=int(body.get("max_duration") or 300),
+                    cookies_text=body.get("cookies"),
+                )
+                log.info(f"[pipeline {pid}] started for {url}")
+                self._json_response(200, {"success": True, "pipeline_id": pid})
+            except Exception as e:
+                log.error(f"[pipeline] start failed: {e}")
+                self._json_response(500, {"error": str(e)})
+            return
+
         if self.path == "/process":
             try:
                 body = json.loads(self._read_body())
