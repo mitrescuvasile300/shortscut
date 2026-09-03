@@ -2112,6 +2112,7 @@ export const getJobInternal = internalQuery({
       videoDownloadUrl: v.optional(v.string()),
       audioDownloadUrl: v.optional(v.string()),
       transcriptSegments: v.optional(v.string()),
+      vpsPipelineId: v.optional(v.string()),
     }),
     v.null(),
   ),
@@ -2120,6 +2121,7 @@ export const getJobInternal = internalQuery({
     if (!job) return null;
     return {
       _id: job._id,
+      vpsPipelineId: job.vpsPipelineId,
       userId: job.userId,
       videoUrl: job.videoUrl,
       videoTitle: job.videoTitle,
@@ -2257,3 +2259,22 @@ export const upsertShort = internalMutation({
     return null;
   },
 });
+
+// Jobs whose VPS script finished but the MP4 pull into storage failed (see vpsPipeline.retryPull).
+export const listFailedPulls = internalQuery({
+  args: {},
+  returns: v.array(
+    v.object({ jobId: v.id("jobs"), userId: v.id("users"), pipelineId: v.string() }),
+  ),
+  handler: async (ctx) => {
+    const failed = await ctx.db
+      .query("jobs")
+      .withIndex("by_status", (q) => q.eq("status", "failed"))
+      .order("desc")
+      .take(50);
+    return failed
+      .filter((j) => j.vpsPipelineId && (j.error || "").includes("niciun short nu a putut fi preluat"))
+      .map((j) => ({ jobId: j._id, userId: j.userId, pipelineId: j.vpsPipelineId as string }));
+  },
+});
+

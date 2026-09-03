@@ -868,7 +868,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "video/mp4")
                 self.send_header("Content-Length", str(size))
-                self.send_header("Content-Disposition", f'attachment; filename="{fp.name}"')
+                # Headers must be latin-1; clip names contain diacritics (ă, ț)
+                # -> ASCII fallback + RFC 5987 filename*.
+                from urllib.parse import quote
+                ascii_name = fp.name.encode("ascii", "ignore").decode() or "short.mp4"
+                ascii_name = ascii_name.replace('"', "")
+                self.send_header(
+                    "Content-Disposition",
+                    f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(fp.name)}",
+                )
                 self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 with open(fp, "rb") as f:

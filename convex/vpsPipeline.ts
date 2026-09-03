@@ -230,6 +230,7 @@ export const pollPipeline = internalAction({
     const byIndex = clips || [];
 
     let ok = 0;
+    let lastErr = "";
     for (const out of st.outputs) {
       const clip = byIndex[out.index];
       if (!clip) continue;
@@ -257,12 +258,15 @@ export const pollPipeline = internalAction({
         });
         ok++;
       } catch (err) {
+        lastErr = err instanceof Error ? err.message : String(err);
         console.error(`[vpsPipeline] clip ${out.index} (${out.name}) failed:`, err);
       }
     }
 
     if (ok === 0) {
-      await fail("Scriptul a terminat, dar niciun short nu a putut fi preluat de pe VPS.");
+      await fail(
+        `Scriptul a terminat, dar niciun short nu a putut fi preluat de pe VPS${lastErr ? ` (${lastErr})` : ""}. Fișierele rămân pe VPS 3h — poți reîncerca preluarea.`,
+      );
       return null;
     }
     await ctx.runMutation(internal.processing.updateJobStatus, {
@@ -271,6 +275,63 @@ export const pollPipeline = internalAction({
       clearError: true,
     });
     console.log(`[vpsPipeline] job ${jobId}: ${ok}/${st.outputs.length} shorts stored (${st.elapsed}s on VPS)`);
+    return null;
+  },
+});
+
+// ── Ops helpers: re-pull finished outputs for jobs that failed only at the
+// "copy MP4s from VPS into storage" step (files stay on the VPS for 3h). ──
+export const retryPull = internalAction({
+  args: { jobId: v.optional(v.id("jobs")) },
+  returns: v.number(),
+  handler: async (ctx, { jobId }): Promise<number> => {
+    type Target = { jobId: Id<"jobs">; userId: Id<"users">; pipelineId: string };
+    const all: Target[] = await ctx.runQuery(internal.processing.listFailedPulls, {});
+    const targets = jobId ? all.filter((j) => j.jobId === jobId) : all;
+    for (const t of targets) {
+      await ctx.runMutation(internal.processing.updateJobStatus, {
+        jobId: t.jobId,
+        status: "generating",
+        clearError: true,
+      });
+      await ctx.scheduler.runAfter(0, internal.vpsPipeline.pollPipeline, {
+        jobId: t.jobId,
+        userId: t.userId,
+        pipelineId: t.pipelineId,
+        startedAt: Date.now(),
+        clipsSaved: true,
+      });
+    }
+    return targets.length;
+  },
+});
+
+// User-facing: re-pull the finished MP4s for my own job (files stay on the VPS 3h).
+export const retryPullForJob = action({
+  args: { jobId: v.id("jobs") },
+  returns: v.null(),
+  handler: async (ctx, { jobId }) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new Error("Not authenticated");
+    const job = await ctx.runQuery(internal.processing.getJobInternal, { jobId });
+    if (!job || job.userId !== userId) throw new Error("Job not found");
+    if (!job.vpsPipelineId) throw new Error("Jobul nu a rulat pe VPS.");
+    const resp = await vpsFetch(`/pipeline/${job.vpsPipelineId}`);
+    if (resp.status === 404) {
+      throw new Error("Fișierele nu mai există pe VPS (au expirat). Rulează procesarea din nou.");
+    }
+    await ctx.runMutation(internal.processing.updateJobStatus, {
+      jobId,
+      status: "generating",
+      clearError: true,
+    });
+    await ctx.scheduler.runAfter(0, internal.vpsPipeline.pollPipeline, {
+      jobId,
+      userId,
+      pipelineId: job.vpsPipelineId,
+      startedAt: Date.now(),
+      clipsSaved: true,
+    });
     return null;
   },
 });

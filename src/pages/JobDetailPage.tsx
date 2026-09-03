@@ -222,6 +222,7 @@ export function JobDetailPage() {
   const refreshVideoUrl = useAction(api.processing.refreshVideoUrl);
   // Runs the exact local script (shortscut_pipeline.py) on the VPS end-to-end.
   const startProcessing = useAction(api.vpsPipeline.startPipeline);
+  const retryPull = useAction(api.vpsPipeline.retryPullForJob);
 
 
   const [processing, setProcessing] = useState(false);
@@ -696,6 +697,30 @@ export function JobDetailPage() {
         <div className="border border-destructive/30 bg-destructive/5 rounded-xl p-5">
           <h3 className="font-semibold text-destructive mb-1">Eroare</h3>
           <p className="text-sm text-destructive/80 mb-3">{job.error}</p>
+          {job.vpsPipelineId && (job.error || "").includes("nu a putut fi preluat") && (
+            <Button
+              size="sm"
+              className="mr-2"
+              disabled={startingBackend}
+              onClick={async () => {
+                if (!jobId) return;
+                setStartingBackend(true);
+                try {
+                  await retryPull({ jobId: jobId as Id<"jobs"> });
+                  toast.success("Se preiau shorturile de pe VPS...");
+                } catch (err) {
+                  toast.error(
+                    `Eroare: ${err instanceof Error ? err.message : "Eroare necunoscută"}`,
+                  );
+                } finally {
+                  setStartingBackend(false);
+                }
+              }}
+            >
+              <Download className="size-4 mr-1.5" />
+              Preia shorturile (fără reprocesare)
+            </Button>
+          )}
           <Button
             size="sm"
             variant="outline"
