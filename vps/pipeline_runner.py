@@ -74,7 +74,7 @@ def _write_cookies(cookies_text: str, dest: Path) -> str | None:
 
 def start(work_dir: Path, *, youtube_url: str, api_key: str, language: str,
           num_shorts: int, min_duration: int, max_duration: int,
-          cookies_text: str | None = None) -> str:
+          cookies_text: str | None = None, gpt_model: str | None = None) -> str:
     """Spawn the script. Returns the pipeline id."""
     if not SCRIPT.exists():
         raise RuntimeError(f"{SCRIPT} missing on the VPS")
@@ -97,6 +97,8 @@ def start(work_dir: Path, *, youtube_url: str, api_key: str, language: str,
 
     log_f = open(job_dir / "log.txt", "w", encoding="utf-8")
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+    if gpt_model and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", gpt_model):
+        env["SHORTSCUT_GPT_MODEL"] = gpt_model  # script default: gpt-5.6-sol
     # Run through a tiny shell wrapper so the exit code lands on disk even if
     # server.py is restarted mid-job; start_new_session detaches the job from
     # the server's process group (systemd KillMode=process leaves it alive).

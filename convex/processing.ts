@@ -1,6 +1,6 @@
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v } from "convex/values";
-import { internal } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import {
   action,
   internalAction,
@@ -1614,6 +1614,18 @@ export const processJob = action({
   args: { jobId: v.id("jobs") },
   returns: v.null(),
   handler: async (ctx, { jobId }) => {
+    // Legacy entry point (old cached frontends, channel monitor): always run
+    // the exact local script on the VPS instead of the old Convex-side flow.
+    await ctx.runAction(api.vpsPipeline.startPipeline, { jobId });
+    return null;
+  },
+});
+
+// Old Convex-side flow kept for reference only (not exported).
+export const _legacyProcessJob = action({
+  args: { jobId: v.id("jobs") },
+  returns: v.null(),
+  handler: async (ctx, { jobId }) => {
     const userId = await getAuthUserId(ctx);
     if (!userId) throw new Error("Not authenticated");
 
@@ -1914,6 +1926,7 @@ export const getUserSettings = internalQuery({
   returns: v.union(
     v.object({
       openaiApiKey: v.optional(v.string()),
+      openaiModel: v.optional(v.string()),
       youtubeCookies: v.optional(v.string()),
     }),
     v.null(),
@@ -1926,6 +1939,7 @@ export const getUserSettings = internalQuery({
     if (!settings) return null;
     return {
       openaiApiKey: settings.openaiApiKey,
+      openaiModel: settings.openaiModel,
       youtubeCookies: settings.youtubeCookies,
     };
   },

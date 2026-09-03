@@ -41,6 +41,28 @@ import {
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 
+/**
+ * Force a real file download. Storage URLs are cross-origin, so a plain
+ * `<a download>` is ignored by browsers (it just navigates to / opens the
+ * video). Fetch → Blob → object URL makes the download attribute work and
+ * lets us download several files one after another.
+ */
+async function downloadFile(url: string, fileName: string): Promise<void> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Give the browser a moment to start the download before revoking.
+  await new Promise((r) => setTimeout(r, 500));
+  URL.revokeObjectURL(objectUrl);
+}
+
 function formatSeconds(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);
@@ -204,6 +226,7 @@ export function JobDetailPage() {
 
   const [processing, setProcessing] = useState(false);
   const [startingBackend, setStartingBackend] = useState(false);
+  const [isDownloadingAll, setIsDownloadingAll] = useState(false);
   const [serverProcessing, setServerProcessing] = useState(false);
   const serverModeRef = useRef(false);
   const [progress, setProgress] = useState<ProcessingProgress | null>(null);
@@ -850,10 +873,10 @@ export function JobDetailPage() {
                                         existingShort?.url ||
                                         generatedBlob?.url;
                                       if (!url) return;
-                                      const a = document.createElement("a");
-                                      a.href = url;
-                                      a.download = `${String(i + 1).padStart(2, "0")}_${clip.title.replace(/[^a-zA-Z0-9]/g, "_").substring(0, 30)}.mp4`;
-                                      a.click();
+                                      void downloadFile(
+                                        url,
+                                        `${String(i + 1).padStart(2, "0")}_${clip.title.replace(/[^a-zA-Z0-9]/g, "_").substring(0, 30)}.mp4`,
+                                      );
                                     }}
                                   >
                                     <Download className="size-3.5 mr-1" />
@@ -963,19 +986,25 @@ export function JobDetailPage() {
                   </div>
                   <Button
                     size="sm"
-                    onClick={() => {
-                      for (const short of shorts || []) {
-                        if (!short.url) continue;
-                        const a = document.createElement("a");
-                        a.href = short.url;
-                        a.download = short.fileName;
-                        a.click();
+                    disabled={isDownloadingAll}
+                    onClick={async () => {
+                      const list = (shorts || []).filter((s) => !!s.url);
+                      if (list.length === 0) return;
+                      setIsDownloadingAll(true);
+                      try {
+                        for (const short of list) {
+                          await downloadFile(short.url as string, short.fileName);
+                        }
+                        toast.success(`${list.length} shorts descărcate!`);
+                      } catch {
+                        toast.error("Descărcarea a eșuat. Încearcă din nou.");
+                      } finally {
+                        setIsDownloadingAll(false);
                       }
-                      toast.success("Descărcare inițiată!");
                     }}
                   >
                     <Download className="size-3.5 mr-1" />
-                    Descarcă Toate
+                    {isDownloadingAll ? "Se descarcă..." : "Descarcă Toate"}
                   </Button>
                 </div>
               </div>

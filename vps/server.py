@@ -968,6 +968,7 @@ class Handler(BaseHTTPRequestHandler):
                     min_duration=int(body.get("min_duration") or 30),
                     max_duration=int(body.get("max_duration") or 300),
                     cookies_text=body.get("cookies"),
+                    gpt_model=body.get("gpt_model") or None,
                 )
                 log.info(f"[pipeline {pid}] started for {url}")
                 self._json_response(200, {"success": True, "pipeline_id": pid})
@@ -1289,5 +1290,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

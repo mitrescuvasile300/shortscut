@@ -91,6 +91,7 @@ export const startPipeline = action({
         body: JSON.stringify({
           youtube_url: job.videoUrl,
           openai_api_key: settings.openaiApiKey,
+          gpt_model: settings.openaiModel || undefined,
           cookies: settings.youtubeCookies || undefined,
           language: job.language || "en",
           num_shorts: job.numShorts,
