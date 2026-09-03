@@ -208,19 +208,27 @@ def download_video(url: str, output_dir: Path, cookies_file: str | None = None) 
         "-o", str(output_path),
         "--no-playlist",
     ]
+    # Attempts: (proxy, cookies) for each proxy; if cookies were given and
+    # everything failed (rotated/expired cookies), retry without cookies.
+    attempts: list[tuple[str | None, str | None]] = [(p, cookies_file) for p in _ytdlp_proxies()]
     if cookies_file:
-        cmd.extend(["--cookies", cookies_file])
-    cmd.append(url)
+        attempts += [(p, None) for p in _ytdlp_proxies()]
 
     result = None
-    for proxy in _ytdlp_proxies():
-        if proxy:
-            print(f"   via proxy {proxy.split('@')[-1]}")
-        result = subprocess.run(_with_proxy(cmd, proxy), capture_output=True, text=True)
+    for proxy, cookies in attempts:
+        attempt = list(cmd)
+        if cookies:
+            attempt.extend(["--cookies", cookies])
+        attempt.append(url)
+        label = " + ".join(x for x in [f"proxy {proxy.split('@')[-1]}" if proxy else "", "cookies" if cookies else ""] if x)
+        if label:
+            print(f"   trying: {label}")
+        result = subprocess.run(_with_proxy(attempt, proxy), capture_output=True, text=True)
         if result.returncode == 0:
             break
-        if proxy:
-            print(f"   ⚠️ proxy failed: {result.stderr.strip().splitlines()[-1][:120] if result.stderr.strip() else 'unknown error'}")
+        if len(attempts) > 1:
+            err = result.stderr.strip().splitlines()[-1][:120] if result.stderr.strip() else "unknown error"
+            print(f"   ⚠️ attempt failed: {err}")
     if result.returncode != 0:
         stderr = result.stderr
         if "Sign in to confirm" in stderr or "bot" in stderr.lower():
