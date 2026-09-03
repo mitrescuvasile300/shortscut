@@ -185,6 +185,15 @@ def is_url(s: str) -> bool:
 
 
 # ─────────────────────────── step 1: download ────────────────────
+def _ytdlp_extra_args() -> list[str]:
+    """Optional yt-dlp args from env (server deployments): proxy for YouTube."""
+    extra: list[str] = []
+    proxy = os.environ.get("SHORTSCUT_YT_PROXY", "").strip()
+    if proxy:
+        extra.extend(["--proxy", proxy])
+    return extra
+
+
 def download_video(url: str, output_dir: Path, cookies_file: str | None = None) -> Path:
     """Download video with yt-dlp."""
     print("\n🎬 Step 1/5: Downloading video...")
@@ -198,6 +207,7 @@ def download_video(url: str, output_dir: Path, cookies_file: str | None = None) 
     ]
     if cookies_file:
         cmd.extend(["--cookies", cookies_file])
+    cmd.extend(_ytdlp_extra_args())
     cmd.append(url)
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -2035,6 +2045,7 @@ def get_video_title(url: str, cookies_file: str | None = None) -> str:
         cmd = ["yt-dlp", "--get-title", "--no-playlist"]
         if cookies_file:
             cmd.extend(["--cookies", cookies_file])
+        cmd.extend(_ytdlp_extra_args())
         cmd.append(url)
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=30,
