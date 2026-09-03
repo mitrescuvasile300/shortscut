@@ -38,6 +38,7 @@ MAX_DURATION = 300  # effectively no upper limit — AI decides natural end
 NUM_SHORTS = 5
 CANDIDATES_PER_CHUNK = 6
 CHUNK_CHARS = 12_000  # ~20 min of transcript per chunk
+GPT_MODEL = os.environ.get("SHORTSCUT_GPT_MODEL", "gpt-5.6-sol")  # clip selection model
 WHISPER_PARALLEL = 6   # concurrent Whisper chunk uploads
 SCAN_PARALLEL = 4      # concurrent GPT section scans
 
@@ -187,23 +188,63 @@ def is_url(s: str) -> bool:
 
 
 # ─────────────────────────── step 1: download ────────────────────
-def _ytdlp_proxies() -> list[str | None]:
-    """Proxy candidates from env (server deployments). Comma-separated list in
-    SHORTSCUT_YT_PROXY; tried in order until yt-dlp succeeds. Empty -> direct only."""
-    raw = os.environ.get("SHORTSCUT_YT_PROXY", "")
-    proxies = [p.strip() for p in raw.split(",") if p.strip()]
-    # The proxy that worked for the title lookup goes first — avoids re-probing
-    # dead/flagged proxies a second time for the actual download.
-    if _GOOD_PROXY[0] in proxies:
-        proxies.remove(_GOOD_PROXY[0])
-        proxies.insert(0, _GOOD_PROXY[0])
-    # Always keep a direct (no-proxy) attempt as the last resort, so an exhausted
-    # or dead proxy pool doesn't fail the job when cookies/direct access would work.
-    return proxies + [None]
-
-
 _GOOD_PROXY: list[str | None] = [None]
 _DEAD_PROXIES: set[str] = set()
+_PROXY_FLAG_TTL = 24 * 3600  # a proxy flagged by YouTube goes to the back of the queue for 24h
+_PROXY_STATE_FILE = Path(os.environ.get("SHORTSCUT_PROXY_STATE") or (Path.home() / ".shortscut_proxy_state.json"))
+
+
+def _load_proxy_state() -> dict:
+    """{"good": proxy|None, "bad": {proxy: unix_ts}} persisted across runs so the
+    next job starts with the proxy that worked last time and skips recently
+    flagged ones (datacenter proxies are often bot-flagged by YouTube)."""
+    try:
+        st = json.loads(_PROXY_STATE_FILE.read_text(encoding="utf-8"))
+        now = time.time()
+        st["bad"] = {k: v for k, v in (st.get("bad") or {}).items() if now - v < _PROXY_FLAG_TTL}
+        return st
+    except Exception:
+        return {"good": None, "bad": {}}
+
+
+def _mark_proxy(proxy: str | None, ok: bool) -> None:
+    """Remember a proxy outcome in-process and on disk (best effort)."""
+    if ok:
+        _GOOD_PROXY[0] = proxy
+    if proxy is None:
+        return
+    try:
+        st = _load_proxy_state()
+        if ok:
+            st["good"] = proxy
+            st["bad"].pop(proxy, None)
+        else:
+            st["bad"][proxy] = time.time()
+            if st.get("good") == proxy:
+                st["good"] = None
+        _PROXY_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _PROXY_STATE_FILE.write_text(json.dumps(st), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _ytdlp_proxies() -> list[str | None]:
+    """Proxy candidates from env (server deployments). Comma-separated list in
+    SHORTSCUT_YT_PROXY; tried in order until yt-dlp succeeds. Empty -> direct only.
+    Order: last-known-good first, then untested, then recently flagged ones."""
+    raw = os.environ.get("SHORTSCUT_YT_PROXY", "")
+    proxies = [p.strip() for p in raw.split(",") if p.strip()]
+    if not proxies:
+        return [None]
+    st = _load_proxy_state()
+    bad = st.get("bad") or {}
+    good = _GOOD_PROXY[0] or st.get("good")
+    fresh = [p for p in proxies if p != good and p not in bad]
+    flagged = sorted((p for p in proxies if p != good and p in bad), key=lambda p: bad[p])
+    ordered = ([good] if good in proxies else []) + fresh + flagged
+    # Always keep a direct (no-proxy) attempt as the last resort, so an exhausted
+    # or dead proxy pool doesn't fail the job when cookies/direct access would work.
+    return ordered + [None]
 
 
 def _proxy_alive(proxy: str, timeout: float = 6.0) -> bool:
@@ -279,8 +320,11 @@ def download_video(url: str, output_dir: Path, cookies_file: str | None = None) 
             print(f"   trying: {label}")
         result = subprocess.run(_with_proxy(attempt, proxy), capture_output=True, text=True)
         if result.returncode == 0:
-            _GOOD_PROXY[0] = proxy
+            _mark_proxy(proxy, ok=True)
             break
+        if proxy and ("Sign in to confirm" in result.stderr or "HTTP Error 403" in result.stderr
+                      or "Video unavailable" in result.stderr):
+            _mark_proxy(proxy, ok=False)  # flagged by YouTube → back of the queue for 24h
         if len(attempts) > 1:
             err = result.stderr.strip().splitlines()[-1][:120] if result.stderr.strip() else "unknown error"
             print(f"   ⚠️ attempt failed: {err}")
@@ -587,7 +631,7 @@ TRANSCRIPT SECTION:
 
     try:
         response = client.chat.completions.create(
-            model="gpt-5.4-mini",
+            model=GPT_MODEL,
             messages=[{"role": "user", "content": prompt}],
             response_format={
                 "type": "json_schema",
@@ -740,7 +784,7 @@ def select_best_clips(client, candidates: list[dict], video_title: str,
 
     try:
         response = client.chat.completions.create(
-            model="gpt-5.4-mini",
+            model=GPT_MODEL,
             messages=[{"role": "user", "content": f"""Select the BEST {num_shorts} clips from {len(candidates)} candidates for "{video_title}".
 Consider: VARIETY of topics, QUALITY of hooks, NO time OVERLAP, HUMOR, REVERSALS, CONTROVERSY.
 TITLE: 5-8 words, curiosity gap, power words, no spoilers. All text in {language}.
@@ -2149,8 +2193,10 @@ def get_video_title(url: str, cookies_file: str | None = None) -> str:
                 _with_proxy(cmd, proxy), capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0 and result.stdout.strip():
-                _GOOD_PROXY[0] = proxy
+                _mark_proxy(proxy, ok=True)
                 return result.stdout.strip()
+            if proxy and ("Sign in to confirm" in result.stderr or "HTTP Error 403" in result.stderr):
+                _mark_proxy(proxy, ok=False)
         return "Podcast"
     except Exception:
         return "Podcast"

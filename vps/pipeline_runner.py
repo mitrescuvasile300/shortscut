@@ -24,6 +24,7 @@ Job directory layout (WORK_DIR/pipeline_<id>/):
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -96,22 +97,96 @@ def start(work_dir: Path, *, youtube_url: str, api_key: str, language: str,
 
     log_f = open(job_dir / "log.txt", "w", encoding="utf-8")
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
-    proc = subprocess.Popen(cmd, stdout=log_f, stderr=subprocess.STDOUT,
-                            cwd=str(job_dir), env=env)
+    # Run through a tiny shell wrapper so the exit code lands on disk even if
+    # server.py is restarted mid-job; start_new_session detaches the job from
+    # the server's process group (systemd KillMode=process leaves it alive).
+    wrapper = f"{shlex.join(cmd)}; echo $? > exit_code"
+    proc = subprocess.Popen(["bash", "-c", wrapper], stdout=log_f, stderr=subprocess.STDOUT,
+                            cwd=str(job_dir), env=env, start_new_session=True)
+    created = time.time()
+    (job_dir / "meta.json").write_text(json.dumps({
+        "id": pid, "os_pid": proc.pid, "created": created, "cookies": cookies_path,
+    }), encoding="utf-8")
     with _lock:
         _jobs[pid] = {
-            "id": pid, "dir": job_dir, "proc": proc, "log_f": log_f,
-            "created": time.time(), "finished": None, "cookies": cookies_path,
+            "id": pid, "dir": job_dir, "proc": proc, "log_f": log_f, "os_pid": proc.pid,
+            "created": created, "finished": None, "cookies": cookies_path,
         }
     threading.Thread(target=_wait, args=(pid,), daemon=True).start()
     return pid
 
 
-def _wait(pid: str):
-    job = _jobs[pid]
-    job["proc"].wait()
-    job["log_f"].close()
-    job["finished"] = time.time()
+def _pid_alive(os_pid: int) -> bool:
+    try:
+        os.kill(os_pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    # zombie check
+    try:
+        state = Path(f"/proc/{os_pid}/stat").read_text().split(")")[-1].split()[0]
+        return state != "Z"
+    except Exception:
+        return True
+
+
+def _exit_code(job: dict) -> int | None:
+    """Exit code of the job, or None while it is still running."""
+    proc = job.get("proc")
+    if proc is not None:
+        rc = proc.poll()
+        if rc is not None:
+            return rc
+        return None
+    ec = job["dir"] / "exit_code"
+    if ec.exists():
+        try:
+            return int(ec.read_text().strip() or 1)
+        except ValueError:
+            return 1
+    if job.get("os_pid") and _pid_alive(job["os_pid"]):
+        return None
+    return 137  # process gone without exit code → killed
+
+
+def recover(work_dir: Path) -> int:
+    """Re-attach to jobs started by a previous server process (after restart)."""
+    n = 0
+    for meta_path in sorted(work_dir.glob("pipeline_*/meta.json")):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        pid = meta.get("id")
+        if not pid or pid in _jobs:
+            continue
+        job_dir = meta_path.parent
+        rc = None
+        if (job_dir / "exit_code").exists():
+            rc = 1
+        elif not (meta.get("os_pid") and _pid_alive(meta["os_pid"])):
+            rc = 137
+        job = {
+            "id": pid, "dir": job_dir, "proc": None, "log_f": None, "os_pid": meta.get("os_pid"),
+            "created": meta.get("created", job_dir.stat().st_mtime),
+            "finished": None, "cookies": meta.get("cookies"),
+        }
+        if rc is not None:
+            job["finished"] = (job_dir / "exit_code").stat().st_mtime if (job_dir / "exit_code").exists() \
+                else max((p.stat().st_mtime for p in job_dir.iterdir()), default=time.time())
+            if not (job_dir / "exit_code").exists():
+                (job_dir / "exit_code").write_text("137\n")
+            _finalize(job)
+        with _lock:
+            _jobs[pid] = job
+        if rc is None:
+            threading.Thread(target=_wait, args=(pid,), daemon=True).start()
+        n += 1
+    return n
+
+
+def _finalize(job: dict):
     if job.get("cookies") and os.path.exists(job["cookies"]):
         os.unlink(job["cookies"])
     # the script leaves the big source video behind; we only need the shorts
@@ -119,6 +194,18 @@ def _wait(pid: str):
         f.unlink(missing_ok=True)
     for f in job["dir"].glob("audio*.mp3"):
         f.unlink(missing_ok=True)
+
+
+def _wait(pid: str):
+    job = _jobs[pid]
+    if job.get("proc") is not None:
+        job["proc"].wait()
+        job["log_f"].close()
+    else:  # recovered job: poll the detached process
+        while _exit_code(job) is None:
+            time.sleep(5)
+    job["finished"] = time.time()
+    _finalize(job)
 
 
 def _read_json(path: Path):
@@ -159,7 +246,7 @@ def status(pid: str) -> dict | None:
         "download_url": f"/pipeline/{pid}/file/{p.name}",
     } for p in outputs if p.stat().st_size > 0]
 
-    rc = job["proc"].poll()
+    rc = _exit_code(job)
     if rc is None:
         state = "running"
         error = None
@@ -172,6 +259,8 @@ def status(pid: str) -> dict | None:
         lines = [l.strip() for l in log_text.splitlines() if l.strip()]
         err_lines = [l for l in lines if "❌" in l or "Error" in l or "error" in l]
         error = " | ".join((err_lines or lines)[-4:]) or f"script exited with code {rc}"
+        if rc == 137 and not err_lines:
+            error = "Procesul a fost oprit (VPS repornit / memorie insuficientă). " + error
 
     return {
         "id": pid,
@@ -202,3 +291,5 @@ def cleanup(now: float | None = None):
         for pid in stale:
             j = _jobs.pop(pid)
             shutil.rmtree(j["dir"], ignore_errors=True)
+
+

@@ -1275,6 +1275,12 @@ def main():
     log.info(f"API Key: {API_KEY[:8]}...")
     log.info(f"Work dir: {WORK_DIR}")
     try:
+        ensure_work_dir()
+        n = pipeline_runner.recover(WORK_DIR)
+        log.info(f"Re-attached to {n} pipeline job(s) from a previous run")
+    except Exception as e:
+        log.error(f"pipeline recover failed: {e}")
+    try:
         server.serve_forever()
     except KeyboardInterrupt:
         log.info("Shutting down...")
@@ -1283,3 +1289,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
