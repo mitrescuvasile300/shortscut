@@ -1,0 +1,9 @@
+# Python deps for the VPS processing server (vps/server.py).
+# Base server (download + ffmpeg crop/silence/subtitles) has zero deps
+# beyond the stdlib + system ffmpeg/yt-dlp binaries.
+#
+# These two are required for vps/face_tracking.py (server-side face
+# detection/tracking, ported from the local shortscut_pipeline.py script).
+# Without them, process_clip() automatically falls back to a center crop.
+opencv-python-headless
+mediapipe

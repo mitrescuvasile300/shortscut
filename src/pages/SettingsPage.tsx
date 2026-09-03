@@ -39,6 +39,17 @@ import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { toast } from "sonner";
 
+const DEFAULT_GPT_MODEL = "gpt-5.6-sol";
+const GPT_MODELS = [
+  { id: "gpt-5.6-sol", label: "gpt-5.6-sol (recomandat)" },
+  { id: "gpt-5.6-luna", label: "gpt-5.6-luna" },
+  { id: "gpt-5.6-terra", label: "gpt-5.6-terra" },
+  { id: "gpt-5.5", label: "gpt-5.5" },
+  { id: "gpt-5.4", label: "gpt-5.4" },
+  { id: "gpt-5.4-mini", label: "gpt-5.4-mini (rapid, ieftin)" },
+  { id: "gpt-4.1", label: "gpt-4.1" },
+];
+
 export function SettingsPage() {
   const user = useQuery(api.auth.currentUser);
   const settings = useQuery(api.settings.get);
@@ -49,6 +60,7 @@ export function SettingsPage() {
 
   const [youtubeApiKey, setYoutubeApiKey] = useState("");
   const [openaiApiKey, setOpenaiApiKey] = useState("");
+  const [openaiModel, setOpenaiModel] = useState(DEFAULT_GPT_MODEL);
   const [defaultLanguage, setDefaultLanguage] = useState("ro");
   const [defaultNumShorts, setDefaultNumShorts] = useState(5);
   const [defaultShortDuration, setDefaultShortDuration] = useState(60);
@@ -63,6 +75,7 @@ export function SettingsPage() {
     if (settings) {
       setYoutubeApiKey(settings.youtubeApiKey || "");
       setOpenaiApiKey(settings.openaiApiKey || "");
+      setOpenaiModel(settings.openaiModel || DEFAULT_GPT_MODEL);
       setYoutubeCookies(settings.youtubeCookies || "");
       setDefaultLanguage(settings.defaultLanguage || "ro");
       setDefaultNumShorts(settings.defaultNumShorts || 5);
@@ -76,6 +89,7 @@ export function SettingsPage() {
       await saveSettings({
         youtubeApiKey: youtubeApiKey || undefined,
         openaiApiKey: openaiApiKey || undefined,
+        openaiModel,
         youtubeCookies: youtubeCookies || undefined,
         defaultLanguage,
         defaultNumShorts,
@@ -197,6 +211,28 @@ export function SettingsPage() {
                 >
                   OpenAI Platform
                 </a>
+              </p>
+            </div>
+
+            {/* OpenAI model for clip selection */}
+            <div className="space-y-2">
+              <Label>Model OpenAI (selecție clipuri)</Label>
+              <Select value={openaiModel} onValueChange={setOpenaiModel}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {GPT_MODELS.map((m) => (
+                    <SelectItem key={m.id} value={m.id}>
+                      {m.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Modelul care alege momentele virale din transcript. Transcrierea
+                folosește mereu Whisper. Se aplică la joburile pornite după
+                salvare.
               </p>
             </div>
           </div>

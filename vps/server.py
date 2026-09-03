@@ -19,12 +19,25 @@ import uuid
 from functools import wraps
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+import face_tracking
+import whisper_subtitles
+import pipeline_runner
 
 # ── Config ────────────────────────────────────────────────────────────
 API_KEY = os.environ.get("SHORTSCUT_API_KEY", "shortcut-vps-2026")
 PORT = int(os.environ.get("PORT", "3458"))
-WORK_DIR = Path("/tmp/shortscut-processing")
-WORK_DIR.mkdir(parents=True, exist_ok=True)
+# Keep runtime files outside /tmp: systemd-tmpfiles may delete an old /tmp
+# directory while this long-running service is still active.
+WORK_DIR = Path(os.environ.get("SHORTSCUT_WORK_DIR", "/var/lib/shortscut-processing"))
+
+
+def ensure_work_dir():
+    """Recreate the runtime directory if an external cleanup removed it."""
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    return WORK_DIR
+
+
+ensure_work_dir()
 MAX_CONCURRENT = 2
 
 logging.basicConfig(
@@ -37,6 +50,120 @@ log = logging.getLogger("shortscut")
 # Track processed files for cleanup
 processed_files: dict[str, dict] = {}  # file_id -> {path, created, size}
 processing_lock = threading.Semaphore(MAX_CONCURRENT)
+
+# ── Source-video fetch cache ──────────────────────────────────────────
+# The browser pipeline can ask the VPS to download the source video
+# (yt-dlp works reliably here) and then reads it back with HTTP Range
+# requests via /file/<id>. Entries live for FETCH_TTL seconds.
+fetch_jobs: dict[str, dict] = {}  # fetch_id -> {status, path, video_key, created, size, width, height, error}
+FETCH_TTL = 2 * 3600
+
+
+def _write_cookies_file(cookies_text, dest_dir):
+    """Write user cookies to a Netscape cookies.txt for yt-dlp.
+    Accepts either Netscape format (tabs) or a raw Cookie header string."""
+    path = os.path.join(dest_dir, "cookies.txt")
+    txt = (cookies_text or "").strip()
+    if not txt:
+        return None
+    if "\t" in txt:  # already Netscape format
+        if not txt.startswith("#"):
+            txt = "# Netscape HTTP Cookie File\n" + txt
+        Path(path).write_text(txt + "\n", encoding="utf-8")
+        return path
+    lines = ["# Netscape HTTP Cookie File"]
+    for pair in txt.split(";"):
+        pair = pair.strip()
+        if "=" not in pair:
+            continue
+        name, _, value = pair.partition("=")
+        lines.append("\t".join([
+            ".youtube.com", "TRUE", "/", "TRUE", "0", name.strip(), value.strip()
+        ]))
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _yt_video_key(url):
+    m = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", url or "")
+    return m.group(1) if m else (url or "")
+
+
+def cleanup_old_fetches():
+    now = time.time()
+    for fid in [f for f, i in list(fetch_jobs.items()) if now - i["created"] > FETCH_TTL]:
+        info = fetch_jobs.pop(fid, None)
+        if info and info.get("path") and os.path.exists(info["path"]):
+            fetch_dir = os.path.dirname(info["path"])
+            shutil.rmtree(fetch_dir, ignore_errors=True)
+            log.info(f"Cleaned up fetched source: {fid}")
+
+
+def _fetch_worker(fetch_id, video_url, fmt="video", cookies_text=None):
+    """Background download of a source video/audio via yt-dlp."""
+    info = fetch_jobs[fetch_id]
+    ext = "m4a" if fmt == "audio" else "mp4"
+    fetch_dir = None
+    out_path = None
+    try:
+        ensure_work_dir()
+        # Cookies must be private to this fetch. A shared cookies.txt races with
+        # transcript cleanup and concurrent fetches.
+        fetch_dir = tempfile.mkdtemp(prefix=f"fetch_{fetch_id}_", dir=WORK_DIR)
+        out_path = os.path.join(fetch_dir, f"source.{ext}")
+        if fmt == "audio":
+            args = [
+                "yt-dlp",
+                "-f", "bestaudio[ext=m4a]/bestaudio",
+                "-o", out_path,
+                "--no-playlist",
+            ]
+        else:
+            args = [
+                "yt-dlp",
+                "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
+                "--merge-output-format", "mp4",
+                "-o", out_path,
+                "--no-playlist",
+            ]
+        cookies_path = _write_cookies_file(cookies_text, fetch_dir) if cookies_text else None
+        if cookies_path:
+            args += ["--cookies", cookies_path]
+        args.append(video_url)
+        _, stderr, rc = run_cmd(args, timeout=900)
+        if rc != 0 or not os.path.exists(out_path):
+            raise RuntimeError(f"yt-dlp failed (rc={rc}): {stderr[-400:]}")
+
+        # Probe dimensions (video only)
+        width, height = 0, 0
+        if fmt == "video":
+            width, height = 1280, 720
+        stdout, _, prc = run_cmd([
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "json", out_path,
+        ], timeout=30)
+        if prc == 0 and fmt == "video":
+            try:
+                streams = json.loads(stdout).get("streams", [])
+                if streams:
+                    width = streams[0].get("width", width)
+                    height = streams[0].get("height", height)
+            except json.JSONDecodeError:
+                pass
+
+        info.update({
+            "status": "ready",
+            "path": out_path,
+            "size": os.path.getsize(out_path),
+            "width": width,
+            "height": height,
+        })
+        log.info(f"[fetch {fetch_id}] ready: {info['size'] / 1e6:.1f} MB, {width}x{height}")
+    except Exception as e:
+        log.error(f"[fetch {fetch_id}] failed: {e}")
+        info.update({"status": "error", "error": str(e)})
+        if fetch_dir:
+            shutil.rmtree(fetch_dir, ignore_errors=True)
 
 
 def cleanup_old_files(max_age_secs=1800):
@@ -248,32 +375,74 @@ def process_clip(input_path, clip_config, video_width, video_height, work_dir):
     end_time = clip_config["end_time"]
     duration = end_time - start_time
     index = clip_config.get("index", 0)
-    out_w, out_h = 1080, 1920
+    # 720x1280 is native Shorts HD and keeps a 5-minute clip well below
+    # Convex's upstream response timeout. 1080x1920 made long jobs take
+    # 7-10 minutes before the VPS could return any headers.
+    out_w, out_h = 720, 1280
     has_subs = bool(clip_config.get("ass_subtitles"))
     ass_content = clip_config.get("ass_subtitles", "")
     remove_silence = clip_config.get("remove_silence", True)
     crop_plan = clip_config.get("crop_plan")
+    auto_face_track = clip_config.get("auto_face_track", True)
 
     output_path = os.path.join(work_dir, f"clip_{index}.mp4")
 
-    # Build default crop plan if none provided
+    # Build crop plan if none provided.
+    # Default: run the same face detection/tracking used by the local
+    # script (face_tracking.py) so the VPS doesn't fall back to a dumb
+    # center crop. Callers that already computed a plan client-side (or
+    # that explicitly pass auto_face_track: false) skip this.
     if not crop_plan or not crop_plan.get("segments"):
-        crop_w = round(video_height * 9 / 16)
-        crop_x = clip_config.get("crop_x")
-        if crop_x is None:
-            crop_x = round((video_width - crop_w) / 2)
-        else:
-            crop_x = min(crop_x, video_width - crop_w)
-        crop_plan = {
-            "videoWidth": video_width,
-            "videoHeight": video_height,
-            "segments": [{
-                "startTime": 0,
-                "endTime": duration,
-                "mode": "center" if clip_config.get("crop_x") is None else "single",
-                "cropX": crop_x
-            }]
-        }
+        crop_x_override = clip_config.get("crop_x")
+        if crop_x_override is None and auto_face_track:
+            try:
+                log.info(f"Clip {index}: running face detection/tracking...")
+                crop_plan = face_tracking.build_face_crop_plan(
+                    sys.executable, input_path, start_time, duration,
+                    video_width, video_height,
+                )
+                seg = crop_plan["segments"][0]
+                log.info(f"Clip {index}: face crop mode = {seg.get('mode')}")
+            except Exception as e:
+                log.warning(f"Clip {index}: face detection failed ({e}), using center crop")
+                crop_plan = None
+
+        if not crop_plan or not crop_plan.get("segments"):
+            crop_w = round(video_height * 9 / 16)
+            crop_x = crop_x_override
+            if crop_x is None:
+                crop_x = round((video_width - crop_w) / 2)
+            else:
+                crop_x = min(crop_x, video_width - crop_w)
+            crop_plan = {
+                "videoWidth": video_width,
+                "videoHeight": video_height,
+                "segments": [{
+                    "startTime": 0,
+                    "endTime": duration,
+                    "mode": "center" if crop_x_override is None else "single",
+                    "cropX": crop_x
+                }]
+            }
+
+    # ── Subtitles: Whisper word-level (same as the local script) ──
+    # Transcribes just this clip's audio, language auto-detected (original
+    # language of the video), 4 UPPERCASE words per line in Arial Black.
+    # Falls back to the caller-provided ass_subtitles (YouTube captions).
+    openai_key = clip_config.get("openai_api_key")
+    if openai_key and clip_config.get("whisper_subtitles", True):
+        try:
+            log.info(f"Clip {index}: transcribing with Whisper for subtitles...")
+            w_ass, w_lang, n_words = whisper_subtitles.build_whisper_ass(
+                input_path, start_time, duration, out_w, out_h,
+                openai_key, work_dir, index,
+            )
+            ass_content = w_ass
+            has_subs = True
+            log.info(f"Clip {index}: Whisper subtitles OK ({n_words} words, lang={w_lang})")
+        except Exception as e:
+            log.warning(f"Clip {index}: Whisper subtitles failed ({e}), "
+                        f"falling back to provided captions")
 
     # ── Silence detection & removal ──
     speaking_segs = None
@@ -467,19 +636,28 @@ def _build_silence_removal_filters(segs, plan, out_w, out_h, has_subs, subs_path
     return {"filter_complex": fc, "out_v": "[cv]", "out_a": "[ca]"}
 
 
-def download_video(video_url, audio_url, work_dir):
-    """Download video (and optionally separate audio) to work_dir. Returns input path and video dimensions."""
+def download_video(video_url, audio_url, work_dir, cookies_text=None, fallback_url=None):
+    """Download video (and optionally separate audio) to work_dir. Returns input path and video dimensions.
+
+    video_url may be a youtube.com URL (downloaded with yt-dlp + cookies) or a
+    direct file URL. fallback_url is an optional direct URL used only if the
+    yt-dlp download fails (curling a youtube.com watch page would just save HTML).
+    """
     video_path = os.path.join(work_dir, "source.mp4")
+    is_youtube_page = "youtube.com" in video_url or "youtu.be" in video_url
+    yt_error = None
 
     # Try yt-dlp first for YouTube URLs
     if "youtube.com" in video_url or "youtu.be" in video_url:
         log.info("Downloading with yt-dlp...")
+        cookies_path = _write_cookies_file(cookies_text, work_dir) if cookies_text else None
         args = [
             "yt-dlp",
             "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/best[height<=720]",
             "--merge-output-format", "mp4",
             "-o", video_path,
             "--no-playlist",
+            *(["--cookies", cookies_path] if cookies_path else []),
             video_url,
         ]
         _, stderr, rc = run_cmd(args, timeout=300, cwd=work_dir)
@@ -488,15 +666,26 @@ def download_video(video_url, audio_url, work_dir):
         else:
             log.warning(f"yt-dlp failed: {stderr[-500:]}")
             video_path = None
+            if "cookies are no longer valid" in stderr or "Sign in to confirm" in stderr:
+                yt_error = ("YouTube a respins cookies-urile (au fost rotite/expirate). "
+                            "Re-exportă cookies-urile din browser (ideal dintr-o fereastră "
+                            "privată, pe care o închizi după export) și pune-le în Settings.")
+            else:
+                yt_error = f"yt-dlp download failed: {stderr[-300:]}"
+            if not fallback_url:
+                raise RuntimeError(yt_error)
+            log.info("Falling back to direct video URL...")
+            video_url = fallback_url
 
     # Direct download fallback (for Piped/cobalt URLs)
     if not os.path.exists(video_path) if video_path else True:
         video_path = os.path.join(work_dir, "source.mp4")
         log.info(f"Direct downloading video...")
-        args = ["curl", "-L", "-o", video_path, "-m", "300", "--retry", "2", video_url]
+        args = ["curl", "-fL", "-o", video_path, "-m", "300", "--retry", "2", video_url]
         _, stderr, rc = run_cmd(args, timeout=360)
-        if rc != 0 or not os.path.exists(video_path):
-            raise RuntimeError(f"Video download failed: {stderr[-500:]}")
+        if rc != 0 or not os.path.exists(video_path) or os.path.getsize(video_path) < 100_000:
+            hint = f" ({yt_error})" if yt_error else ""
+            raise RuntimeError(f"Video download failed{hint}: {stderr[-300:]}")
         log.info(f"Downloaded video: {os.path.getsize(video_path) / 1e6:.1f} MB")
 
     # Download separate audio if provided
@@ -581,6 +770,113 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(200, {"status": "ok", "service": "shortscut-vps"})
             return
 
+        # Fetch-cache status (ids are unguessable UUIDs — no key needed)
+        if self.path.startswith("/fetch-status"):
+            from urllib.parse import parse_qs, urlparse
+            q = parse_qs(urlparse(self.path).query)
+            fid = (q.get("id") or [""])[0]
+            info = fetch_jobs.get(fid)
+            if not info:
+                self._json_response(404, {"status": "error", "error": "Unknown fetch id"})
+                return
+            self._json_response(200, {
+                "status": info["status"],
+                "size": info.get("size", 0),
+                "width": info.get("width"),
+                "height": info.get("height"),
+                "error": info.get("error"),
+            })
+            return
+
+        # Serve a fetched source video with full HTTP Range support so the
+        # browser's segment downloader can read only each clip's bytes.
+        if self.path.startswith("/file/"):
+            fid = self.path.split("/file/")[1].split("?")[0]
+            info = fetch_jobs.get(fid)
+            if not info or info.get("status") != "ready" or not os.path.exists(info.get("path", "")):
+                self._json_response(404, {"error": "File not found or not ready"})
+                return
+            path = info["path"]
+            size = os.path.getsize(path)
+            start, end = 0, size - 1
+            status = 200
+            range_header = self.headers.get("Range")
+            if range_header:
+                m = re.match(r"bytes=(\d*)-(\d*)", range_header)
+                if m and (m.group(1) or m.group(2)):
+                    if m.group(1):
+                        start = int(m.group(1))
+                        if m.group(2):
+                            end = min(int(m.group(2)), size - 1)
+                    else:
+                        start = max(0, size - int(m.group(2)))
+                    if start >= size or start > end:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.send_header("Access-Control-Allow-Origin", "*")
+                        self.end_headers()
+                        return
+                    status = 206
+            length = end - start + 1
+            self.send_response(status)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Accept-Ranges", "bytes")
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header(
+                "Access-Control-Expose-Headers",
+                "Content-Length, Content-Range, Accept-Ranges",
+            )
+            self.end_headers()
+            try:
+                with open(path, "rb") as f:
+                    f.seek(start)
+                    remaining = length
+                    while remaining > 0:
+                        chunk = f.read(min(256 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        # Full local-script pipeline: status + files
+        if self.path.startswith("/pipeline/"):
+            parts = self.path.split("?")[0].strip("/").split("/")
+            # /pipeline/<id>
+            if len(parts) == 2:
+                if not self._check_auth():
+                    return
+                st = pipeline_runner.status(parts[1])
+                if not st:
+                    self._json_response(404, {"error": "Pipeline not found"})
+                    return
+                self._json_response(200, st)
+                return
+            # /pipeline/<id>/file/<name>
+            if len(parts) == 4 and parts[2] == "file":
+                from urllib.parse import unquote
+                fp = pipeline_runner.file_path(parts[1], unquote(parts[3]))
+                if not fp:
+                    self._json_response(404, {"error": "File not found"})
+                    return
+                size = fp.stat().st_size
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Content-Disposition", f'attachment; filename="{fp.name}"')
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                with open(fp, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile)
+                return
+            self._json_response(404, {"error": "Not found"})
+            return
+
         # Download processed file
         if self.path.startswith("/download/"):
             file_id = self.path.split("/download/")[1]
@@ -606,7 +902,81 @@ class Handler(BaseHTTPRequestHandler):
         if not self._check_auth():
             return
 
+        # Start a source-video fetch (browser pipeline reads it back via /file)
+        if self.path == "/fetch":
+            try:
+                body = json.loads(self._read_body())
+            except (json.JSONDecodeError, ValueError) as e:
+                self._json_response(400, {"error": f"Invalid JSON: {e}"})
+                return
+            video_url = body.get("video_url")
+            if not video_url:
+                self._json_response(400, {"error": "video_url required"})
+                return
+            fmt = body.get("format", "video")
+            cookies_text = body.get("cookies")
+
+            cleanup_old_fetches()
+
+            # Dedupe: reuse an in-flight or ready fetch of the same video+format
+            key = f"{_yt_video_key(video_url)}:{fmt}"
+            for fid, info in fetch_jobs.items():
+                if info.get("video_key") == key and info["status"] in ("downloading", "ready"):
+                    if info["status"] == "ready" and not os.path.exists(info.get("path", "")):
+                        continue
+                    log.info(f"[fetch] Reusing {info['status']} fetch {fid} for {key}")
+                    self._json_response(200, {"fetch_id": fid, "status": info["status"]})
+                    return
+
+            fetch_id = str(uuid.uuid4())
+            fetch_jobs[fetch_id] = {
+                "status": "downloading",
+                "path": None,
+                "video_key": key,
+                "created": time.time(),
+                "size": 0,
+            }
+            threading.Thread(
+                target=_fetch_worker,
+                args=(fetch_id, video_url, fmt, cookies_text),
+                daemon=True,
+            ).start()
+            log.info(f"[fetch] Started {fetch_id} for {video_url}")
+            self._json_response(200, {"fetch_id": fetch_id, "status": "downloading"})
+            return
+
         # Process a full job (download + all clips)
+        # Run the exact local script (shortscut_pipeline.py) end-to-end.
+        # Body: youtube_url, openai_api_key, language, num_shorts,
+        #       min_duration, max_duration, cookies (optional)
+        if self.path == "/pipeline":
+            try:
+                body = json.loads(self._read_body())
+                url = body.get("youtube_url") or body.get("video_url")
+                key = body.get("openai_api_key")
+                if not url or not key:
+                    self._json_response(400, {"error": "youtube_url and openai_api_key are required"})
+                    return
+                pipeline_runner.cleanup()
+                ensure_work_dir()
+                pid = pipeline_runner.start(
+                    WORK_DIR,
+                    youtube_url=url,
+                    api_key=key,
+                    language=body.get("language") or "en",
+                    num_shorts=int(body.get("num_shorts") or 5),
+                    min_duration=int(body.get("min_duration") or 30),
+                    max_duration=int(body.get("max_duration") or 300),
+                    cookies_text=body.get("cookies"),
+                    gpt_model=body.get("gpt_model") or None,
+                )
+                log.info(f"[pipeline {pid}] started for {url}")
+                self._json_response(200, {"success": True, "pipeline_id": pid})
+            except Exception as e:
+                log.error(f"[pipeline] start failed: {e}")
+                self._json_response(500, {"error": str(e)})
+            return
+
         if self.path == "/process":
             try:
                 body = json.loads(self._read_body())
@@ -618,6 +988,8 @@ class Handler(BaseHTTPRequestHandler):
             audio_url = body.get("audio_url")
             youtube_url = body.get("youtube_url")
             clips = body.get("clips", [])
+            cookies_text = body.get("cookies")
+            openai_api_key = body.get("openai_api_key")
             provided_width = body.get("video_width")
             provided_height = body.get("video_height")
 
@@ -633,19 +1005,25 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response(503, {"error": "Server busy, try again later"})
                 return
 
+            ensure_work_dir()
             work_dir = tempfile.mkdtemp(dir=WORK_DIR)
             try:
                 cleanup_old_files()
 
                 # Download video
                 dl_url = youtube_url or video_url
-                input_path, det_width, det_height = download_video(dl_url, audio_url, work_dir)
+                input_path, det_width, det_height = download_video(
+                    dl_url, audio_url, work_dir, cookies_text,
+                    fallback_url=video_url if youtube_url and video_url else None,
+                )
                 video_width = provided_width or det_width
                 video_height = provided_height or det_height
 
                 # Process each clip
                 results = []
                 for clip_config in clips:
+                    if openai_api_key and not clip_config.get("openai_api_key"):
+                        clip_config["openai_api_key"] = openai_api_key
                     try:
                         output_path = process_clip(
                             input_path, clip_config, video_width, video_height, work_dir
@@ -702,13 +1080,31 @@ class Handler(BaseHTTPRequestHandler):
 
             video_url = body.get("video_url") or body.get("youtube_url")
             lang = body.get("lang", "en")
+            cookies_text = body.get("cookies")
             if not video_url:
                 self._json_response(400, {"error": "video_url required"})
                 return
 
+            # LANGUAGE FALLBACKS: the job language (e.g. "ro") often doesn't
+            # match the video's language (e.g. an English podcast). Asking
+            # yt-dlp for ONLY "ro" then returned zero files → 404 → the whole
+            # pipeline failed. Request the job language AND the original/
+            # English tracks in one pass; the parser prefers the first match.
+            # Shorts subtitles should preserve the spoken English, regardless
+            # of the UI/analysis language (titles and reasoning may still be RO).
+            # Prefer the original English track, then English auto-captions,
+            # and only then the requested-language fallback.
+            lang_list = ",".join(dict.fromkeys([
+                "en-orig", "en", lang, f"{lang}-orig",
+            ]))
+
+            ensure_work_dir()
             work_dir = tempfile.mkdtemp(dir=WORK_DIR)
             try:
-                log.info(f"[transcript] Extracting subtitles for {video_url} (lang={lang})")
+                log.info(f"[transcript] Extracting subtitles for {video_url} (langs={lang_list})")
+
+                cookies_path = _write_cookies_file(cookies_text, work_dir) if cookies_text else None
+                cookie_args = ["--cookies", cookies_path] if cookies_path else []
 
                 # Use yt-dlp to extract subtitles without downloading video
                 out_template = os.path.join(work_dir, "subs")
@@ -717,9 +1113,10 @@ class Handler(BaseHTTPRequestHandler):
                     "--skip-download",
                     "--write-auto-sub",
                     "--write-sub",
-                    "--sub-lang", lang,
+                    "--sub-lang", lang_list,
                     "--sub-format", "json3",
                     "--output", out_template,
+                    *cookie_args,
                     video_url,
                 ]
                 stdout, stderr, rc = run_cmd(cmd, timeout=120, cwd=work_dir)
@@ -732,8 +1129,21 @@ class Handler(BaseHTTPRequestHandler):
                     })
                     return
 
+                def _pick_sub_file(ext):
+                    """Prefer the requested language, then original, then en."""
+                    files = list(Path(work_dir).glob(f"subs*.{ext}"))
+                    if not files:
+                        return []
+                    def rank(f):
+                        name = f.name
+                        for i, code in enumerate(lang_list.split(",")):
+                            if f".{code}." in name:
+                                return i
+                        return 99
+                    return sorted(files, key=rank)
+
                 # Find the subtitle file (json3 format)
-                sub_files = list(Path(work_dir).glob("subs*.json3"))
+                sub_files = _pick_sub_file("json3")
                 if not sub_files:
                     # Try VTT fallback
                     cmd2 = [
@@ -741,13 +1151,14 @@ class Handler(BaseHTTPRequestHandler):
                         "--skip-download",
                         "--write-auto-sub",
                         "--write-sub",
-                        "--sub-lang", lang,
+                        "--sub-lang", lang_list,
                         "--sub-format", "vtt",
                         "--output", out_template,
+                        *cookie_args,
                         video_url,
                     ]
                     stdout2, stderr2, rc2 = run_cmd(cmd2, timeout=120, cwd=work_dir)
-                    sub_files = list(Path(work_dir).glob("subs*.vtt"))
+                    sub_files = _pick_sub_file("vtt")
 
                 if not sub_files:
                     log.warning(f"[transcript] No subtitle files found")
@@ -864,6 +1275,12 @@ def main():
     log.info(f"Shortscut VPS Processing Server starting on port {PORT}")
     log.info(f"API Key: {API_KEY[:8]}...")
     log.info(f"Work dir: {WORK_DIR}")
+    try:
+        ensure_work_dir()
+        n = pipeline_runner.recover(WORK_DIR)
+        log.info(f"Re-attached to {n} pipeline job(s) from a previous run")
+    except Exception as e:
+        log.error(f"pipeline recover failed: {e}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

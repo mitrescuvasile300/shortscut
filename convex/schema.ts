@@ -10,6 +10,7 @@ const schema = defineSchema({
     userId: v.id("users"),
     youtubeApiKey: v.optional(v.string()),
     openaiApiKey: v.optional(v.string()),
+    openaiModel: v.optional(v.string()), // GPT model for clip selection (default gpt-5.6-sol)
     youtubeCookies: v.optional(v.string()), // Netscape cookies.txt or raw Cookie header for YouTube
     defaultLanguage: v.optional(v.string()),
     defaultShortDuration: v.optional(v.number()), // seconds
@@ -43,6 +44,7 @@ const schema = defineSchema({
     audioDownloadUrl: v.optional(v.string()), // Direct download URL (audio-only, for muxing)
     videoDownloadExpiry: v.optional(v.number()), // Expiry timestamp
     error: v.optional(v.string()),
+    vpsPipelineId: v.optional(v.string()), // set when the job runs the full script on the VPS
   })
     .index("by_userId", ["userId"])
     .index("by_status", ["status"]),
