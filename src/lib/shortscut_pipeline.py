@@ -185,13 +185,16 @@ def is_url(s: str) -> bool:
 
 
 # ─────────────────────────── step 1: download ────────────────────
-def _ytdlp_extra_args() -> list[str]:
-    """Optional yt-dlp args from env (server deployments): proxy for YouTube."""
-    extra: list[str] = []
-    proxy = os.environ.get("SHORTSCUT_YT_PROXY", "").strip()
-    if proxy:
-        extra.extend(["--proxy", proxy])
-    return extra
+def _ytdlp_proxies() -> list[str | None]:
+    """Proxy candidates from env (server deployments). Comma-separated list in
+    SHORTSCUT_YT_PROXY; tried in order until yt-dlp succeeds. Empty -> direct only."""
+    raw = os.environ.get("SHORTSCUT_YT_PROXY", "")
+    proxies = [p.strip() for p in raw.split(",") if p.strip()]
+    return proxies or [None]
+
+
+def _with_proxy(cmd: list[str], proxy: str | None) -> list[str]:
+    return cmd + ["--proxy", proxy] if proxy else list(cmd)
 
 
 def download_video(url: str, output_dir: Path, cookies_file: str | None = None) -> Path:
@@ -207,10 +210,17 @@ def download_video(url: str, output_dir: Path, cookies_file: str | None = None) 
     ]
     if cookies_file:
         cmd.extend(["--cookies", cookies_file])
-    cmd.extend(_ytdlp_extra_args())
     cmd.append(url)
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = None
+    for proxy in _ytdlp_proxies():
+        if proxy:
+            print(f"   via proxy {proxy.split('@')[-1]}")
+        result = subprocess.run(_with_proxy(cmd, proxy), capture_output=True, text=True)
+        if result.returncode == 0:
+            break
+        if proxy:
+            print(f"   ⚠️ proxy failed: {result.stderr.strip().splitlines()[-1][:120] if result.stderr.strip() else 'unknown error'}")
     if result.returncode != 0:
         stderr = result.stderr
         if "Sign in to confirm" in stderr or "bot" in stderr.lower():
@@ -2045,12 +2055,14 @@ def get_video_title(url: str, cookies_file: str | None = None) -> str:
         cmd = ["yt-dlp", "--get-title", "--no-playlist"]
         if cookies_file:
             cmd.extend(["--cookies", cookies_file])
-        cmd.extend(_ytdlp_extra_args())
         cmd.append(url)
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30,
-        )
-        return result.stdout.strip() or "Podcast"
+        for proxy in _ytdlp_proxies():
+            result = subprocess.run(
+                _with_proxy(cmd, proxy), capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        return "Podcast"
     except Exception:
         return "Podcast"
 
