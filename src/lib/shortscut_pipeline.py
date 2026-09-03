@@ -38,6 +38,8 @@ MAX_DURATION = 300  # effectively no upper limit — AI decides natural end
 NUM_SHORTS = 5
 CANDIDATES_PER_CHUNK = 6
 CHUNK_CHARS = 12_000  # ~20 min of transcript per chunk
+WHISPER_PARALLEL = 6   # concurrent Whisper chunk uploads
+SCAN_PARALLEL = 4      # concurrent GPT section scans
 
 # ── Silence removal constants ────────────────────────────────────
 SILENCE_THRESHOLD_DB = -30   # dB below which audio is considered silent
@@ -190,7 +192,58 @@ def _ytdlp_proxies() -> list[str | None]:
     SHORTSCUT_YT_PROXY; tried in order until yt-dlp succeeds. Empty -> direct only."""
     raw = os.environ.get("SHORTSCUT_YT_PROXY", "")
     proxies = [p.strip() for p in raw.split(",") if p.strip()]
-    return proxies or [None]
+    # The proxy that worked for the title lookup goes first — avoids re-probing
+    # dead/flagged proxies a second time for the actual download.
+    if _GOOD_PROXY[0] in proxies:
+        proxies.remove(_GOOD_PROXY[0])
+        proxies.insert(0, _GOOD_PROXY[0])
+    # Always keep a direct (no-proxy) attempt as the last resort, so an exhausted
+    # or dead proxy pool doesn't fail the job when cookies/direct access would work.
+    return proxies + [None]
+
+
+_GOOD_PROXY: list[str | None] = [None]
+_DEAD_PROXIES: set[str] = set()
+
+
+def _proxy_alive(proxy: str, timeout: float = 6.0) -> bool:
+    """Cheap CONNECT probe so dead/exhausted proxies (e.g. Webshare 402
+    bandwidth limit) are skipped instead of costing a full yt-dlp retry cycle."""
+    import base64
+    import http.client
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(proxy)
+        conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+        headers = {"Host": "www.youtube.com:443"}
+        if u.username:
+            token = base64.b64encode(f"{u.username}:{u.password or ''}".encode()).decode()
+            headers["Proxy-Authorization"] = f"Basic {token}"
+        conn.request("CONNECT", "www.youtube.com:443", headers=headers)
+        resp = conn.getresponse()
+        ok = 200 <= resp.status < 300
+        if not ok:
+            print(f"   ⏭️  proxy {u.hostname}:{u.port} unusable ({resp.status} {resp.getheader('X-Webshare-Reason') or resp.reason})")
+        conn.close()
+        return ok
+    except Exception as e:
+        print(f"   ⏭️  proxy {proxy.split('@')[-1]} unreachable ({type(e).__name__})")
+        return False
+
+
+def _live_proxies() -> list[str | None]:
+    """_ytdlp_proxies() minus proxies that already failed the health probe."""
+    out: list[str | None] = []
+    for p in _ytdlp_proxies():
+        if p is None or p == _GOOD_PROXY[0]:
+            out.append(p)
+        elif p in _DEAD_PROXIES:
+            continue
+        elif _proxy_alive(p):
+            out.append(p)
+        else:
+            _DEAD_PROXIES.add(p)
+    return out
 
 
 def _with_proxy(cmd: list[str], proxy: str | None) -> list[str]:
@@ -210,9 +263,10 @@ def download_video(url: str, output_dir: Path, cookies_file: str | None = None) 
     ]
     # Attempts: (proxy, cookies) for each proxy; if cookies were given and
     # everything failed (rotated/expired cookies), retry without cookies.
-    attempts: list[tuple[str | None, str | None]] = [(p, cookies_file) for p in _ytdlp_proxies()]
+    proxies = _live_proxies()
+    attempts: list[tuple[str | None, str | None]] = [(p, cookies_file) for p in proxies]
     if cookies_file:
-        attempts += [(p, None) for p in _ytdlp_proxies()]
+        attempts += [(p, None) for p in proxies]
 
     result = None
     for proxy, cookies in attempts:
@@ -225,6 +279,7 @@ def download_video(url: str, output_dir: Path, cookies_file: str | None = None) 
             print(f"   trying: {label}")
         result = subprocess.run(_with_proxy(attempt, proxy), capture_output=True, text=True)
         if result.returncode == 0:
+            _GOOD_PROXY[0] = proxy
             break
         if len(attempts) > 1:
             err = result.stderr.strip().splitlines()[-1][:120] if result.stderr.strip() else "unknown error"
@@ -288,8 +343,9 @@ def extract_audio(video_path: Path, output_dir: Path) -> Path:
     return audio_path
 
 
-def split_audio(audio_path: Path, max_size_mb: float = 24.0) -> list[Path]:
-    """Split audio into chunks if over Whisper's 25 MB limit."""
+def split_audio(audio_path: Path, max_size_mb: float = 12.0) -> list[Path]:
+    """Split audio into chunks for Whisper (API limit 25 MB).
+    Chunks are ~12 MB (~26 min at 64 kbps) so they can be transcribed in parallel."""
     size_mb = audio_path.stat().st_size / (1024 * 1024)
     if size_mb <= max_size_mb:
         return [audio_path]
@@ -334,47 +390,65 @@ def transcribe_with_whisper(audio_path: Path, api_key: str, output_dir: Path) ->
     chunks = split_audio(audio_path)
     all_segments = []
     all_words = []
-    offset = 0.0
 
-    for i, chunk in enumerate(chunks):
-        if len(chunks) > 1:
-            print(f"  Transcribing chunk {i + 1}/{len(chunks)}...")
-        else:
-            print("  Sending to Whisper API...")
+    def _probe_duration(path: Path) -> float:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True,
+        )
+        return float(r.stdout.strip())
 
-        client = openai.OpenAI(api_key=api_key)
+    # Offsets: chunk i starts at the sum of durations of chunks 0..i-1
+    offsets = [0.0]
+    if len(chunks) > 1:
+        for chunk in chunks[:-1]:
+            offsets.append(offsets[-1] + _probe_duration(chunk))
 
-        with open(chunk, "rb") as f:
-            response = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="verbose_json",
-                timestamp_granularities=["word", "segment"],
-            )
+    def _transcribe_chunk(idx: int) -> dict:
+        # Retry a few times: transient API/network errors must not kill a 2h job
+        last_err = None
+        for attempt in range(3):
+            try:
+                client = openai.OpenAI(api_key=api_key, timeout=600, max_retries=2)
+                with open(chunks[idx], "rb") as f:
+                    response = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=f,
+                        response_format="verbose_json",
+                        timestamp_granularities=["word", "segment"],
+                    )
+                return response.model_dump() if hasattr(response, "model_dump") else response
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                print(f"  ⚠️ chunk {idx + 1} attempt {attempt + 1} failed: {str(e)[:120]}", flush=True)
+                time.sleep(5 * (attempt + 1))
+        raise last_err
 
-        resp_dict = response.model_dump() if hasattr(response, "model_dump") else response
+    if len(chunks) > 1:
+        # Chunks are independent → transcribe them in parallel (network-bound)
+        from concurrent.futures import ThreadPoolExecutor
+        workers = min(len(chunks), WHISPER_PARALLEL)
+        print(f"  Transcribing {len(chunks)} chunks ({workers} in parallel)...", flush=True)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results = list(pool.map(_transcribe_chunk, range(len(chunks))))
+    else:
+        print("  Sending to Whisper API...")
+        results = [_transcribe_chunk(0)]
 
+    for resp_dict, offset in zip(results, offsets):
         for seg in resp_dict.get("segments", []):
             all_segments.append({
                 "start": seg["start"] + offset,
                 "end": seg["end"] + offset,
                 "text": seg["text"].strip(),
             })
-
         for w in resp_dict.get("words", []):
             all_words.append({
                 "start": w["start"] + offset,
                 "end": w["end"] + offset,
                 "word": w["word"],
             })
-
-        if len(chunks) > 1:
-            result = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                 "-of", "default=noprint_wrappers=1:nokey=1", str(chunk)],
-                capture_output=True, text=True,
-            )
-            offset += float(result.stdout.strip())
 
     # Build formatted transcript text with timestamps
     lines = []
@@ -733,10 +807,16 @@ def analyze_transcript(api_key: str, transcript: dict, video_title: str,
     print(f"  Scanning {len(chunks)} transcript sections...")
 
     all_candidates = []
-    for i, chunk in enumerate(chunks):
-        print(f"  📡 Section {i + 1}/{len(chunks)}...", end="", flush=True)
-        candidates = scan_chunk_for_candidates(client, chunk, i, len(chunks), video_title, language)
-        print(f" → {len(candidates)} candidates")
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _scan(i: int) -> list[dict]:
+        return scan_chunk_for_candidates(client, chunks[i], i, len(chunks), video_title, language)
+
+    # Sections are independent → scan in parallel, keep section order
+    with ThreadPoolExecutor(max_workers=min(len(chunks), SCAN_PARALLEL)) as pool:
+        per_section = list(pool.map(_scan, range(len(chunks))))
+    for i, candidates in enumerate(per_section):
+        print(f"  📡 Section {i + 1}/{len(chunks)} → {len(candidates)} candidates")
         all_candidates.extend(candidates)
 
     if not all_candidates:
@@ -2064,11 +2144,12 @@ def get_video_title(url: str, cookies_file: str | None = None) -> str:
         if cookies_file:
             cmd.extend(["--cookies", cookies_file])
         cmd.append(url)
-        for proxy in _ytdlp_proxies():
+        for proxy in _live_proxies():
             result = subprocess.run(
                 _with_proxy(cmd, proxy), capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0 and result.stdout.strip():
+                _GOOD_PROXY[0] = proxy
                 return result.stdout.strip()
         return "Podcast"
     except Exception:
