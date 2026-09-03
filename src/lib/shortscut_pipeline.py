@@ -39,6 +39,8 @@ NUM_SHORTS = 5
 CANDIDATES_PER_CHUNK = 6
 CHUNK_CHARS = 12_000  # ~20 min of transcript per chunk
 GPT_MODEL = os.environ.get("SHORTSCUT_GPT_MODEL", "gpt-5.6-sol")  # clip selection model
+# gpt-5.x reasoning models only accept the default temperature; older models keep 0.7
+_GPT_EXTRA: dict = {} if GPT_MODEL.startswith(("gpt-5", "o")) else {"temperature": 0.7}
 WHISPER_PARALLEL = 6   # concurrent Whisper chunk uploads
 SCAN_PARALLEL = 4      # concurrent GPT section scans
 
@@ -644,7 +646,7 @@ TRANSCRIPT SECTION:
                     },
                 },
             },
-            temperature=0.7,
+            **_GPT_EXTRA,
         )
         data = json.loads(response.choices[0].message.content)
     except Exception as e:
@@ -800,7 +802,7 @@ Candidates:
                     "schema": {"type": "object", "properties": properties},
                 },
             },
-            temperature=0.5,
+            **_GPT_EXTRA,
         )
         data = json.loads(response.choices[0].message.content)
     except Exception as e:
