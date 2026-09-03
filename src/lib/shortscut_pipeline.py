@@ -236,6 +236,16 @@ def _ytdlp_proxies() -> list[str | None]:
     Order: last-known-good first, then untested, then recently flagged ones."""
     raw = os.environ.get("SHORTSCUT_YT_PROXY", "")
     proxies = [p.strip() for p in raw.split(",") if p.strip()]
+    # Server deployments: a file maintained by vps/proxy_sync.py (Webshare API +
+    # YouTube check, verified-good first) overrides the static env list.
+    pf = os.environ.get("SHORTSCUT_YT_PROXY_FILE")
+    if pf and Path(pf).is_file():
+        try:
+            from_file = [l.strip() for l in Path(pf).read_text(encoding="utf-8").splitlines() if l.strip() and not l.startswith("#")]
+            if from_file:
+                proxies = from_file
+        except Exception:
+            pass
     if not proxies:
         return [None]
     st = _load_proxy_state()
