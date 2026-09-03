@@ -1821,8 +1821,15 @@ def get_crop_x_at_time(face_info: dict, t: float, src_w: int, crop_w: int) -> in
 
 # ─────────────────────────── step 5: generate shorts ─────────────
 def generate_ass_subtitles(words: list[dict], start_time: float,
-                           end_time: float, out_w: int, out_h: int) -> str:
-    """Generate ASS subtitle file with word-grouped lines."""
+                           end_time: float, out_w: int, out_h: int,
+                           dual_ranges: list[tuple[float, float]] | None = None) -> str:
+    """Generate ASS subtitle file with word-grouped lines.
+
+    dual_ranges: clip-relative (start, end) windows where the frame is a
+    top/bottom split-screen; lines falling there use the `Middle` style
+    (vertically centred, on the seam between the two people) instead of the
+    bottom-anchored default."""
+    dual_ranges = dual_ranges or []
     clip_words = [
         w for w in words
         if w["start"] >= start_time - 0.5 and w["end"] <= end_time + 0.5
@@ -1844,6 +1851,7 @@ ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,Arial Black,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},2,40,40,{margin_v},1
+Style: Middle,Arial Black,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,{outline},{shadow},5,40,40,0,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -1872,7 +1880,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         text = text.replace("{", "").replace("}", "").replace("\\", "")
         text = text.upper()
 
-        ass += f"Dialogue: 0,{fmt_ass_time(line_start)},{fmt_ass_time(line_end)},Default,,0,0,0,,{text}\n"
+        mid_t = (line_start + line_end) / 2
+        style = "Middle" if any(a <= mid_t <= b for a, b in dual_ranges) else "Default"
+        ass += f"Dialogue: 0,{fmt_ass_time(line_start)},{fmt_ass_time(line_end)},{style},,0,0,0,,{text}\n"
 
     return ass
 
@@ -2062,8 +2072,12 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
         print(f"     {ts_str} → +{dur}s (Score: {clip['viralScore']}/10)")
 
         # Generate ASS subtitles from Whisper transcript
+        dual_ranges = [
+            (ls, le) for (ls, le, lay) in _face_layout_segments(face_info, dur)
+            if lay.get("mode") == "dual"
+        ]
         ass_content = generate_ass_subtitles(
-            transcript["words"], start, start + dur, out_w, out_h,
+            transcript["words"], start, start + dur, out_w, out_h, dual_ranges,
         )
 
         # ── Silence removal for this clip ────────────────────────
