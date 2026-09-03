@@ -20,6 +20,8 @@ from functools import wraps
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
+import face_tracking
+
 # ── Config ────────────────────────────────────────────────────────────
 API_KEY = os.environ.get("SHORTSCUT_API_KEY", "shortcut-vps-2026")
 PORT = int(os.environ.get("PORT", "3458"))
@@ -253,27 +255,47 @@ def process_clip(input_path, clip_config, video_width, video_height, work_dir):
     ass_content = clip_config.get("ass_subtitles", "")
     remove_silence = clip_config.get("remove_silence", True)
     crop_plan = clip_config.get("crop_plan")
+    auto_face_track = clip_config.get("auto_face_track", True)
 
     output_path = os.path.join(work_dir, f"clip_{index}.mp4")
 
-    # Build default crop plan if none provided
+    # Build crop plan if none provided.
+    # Default: run the same face detection/tracking used by the local
+    # script (vps/face_tracking.py) so the VPS doesn't fall back to a dumb
+    # center crop. Callers that already computed a plan client-side (or
+    # that explicitly pass auto_face_track: false) skip this.
     if not crop_plan or not crop_plan.get("segments"):
-        crop_w = round(video_height * 9 / 16)
-        crop_x = clip_config.get("crop_x")
-        if crop_x is None:
-            crop_x = round((video_width - crop_w) / 2)
-        else:
-            crop_x = min(crop_x, video_width - crop_w)
-        crop_plan = {
-            "videoWidth": video_width,
-            "videoHeight": video_height,
-            "segments": [{
-                "startTime": 0,
-                "endTime": duration,
-                "mode": "center" if clip_config.get("crop_x") is None else "single",
-                "cropX": crop_x
-            }]
-        }
+        crop_x_override = clip_config.get("crop_x")
+        if crop_x_override is None and auto_face_track:
+            try:
+                log.info(f"Clip {index}: running face detection/tracking...")
+                crop_plan = face_tracking.build_face_crop_plan(
+                    sys.executable, input_path, start_time, duration,
+                    video_width, video_height,
+                )
+                seg = crop_plan["segments"][0]
+                log.info(f"Clip {index}: face crop mode = {seg.get('mode')}")
+            except Exception as e:
+                log.warning(f"Clip {index}: face detection failed ({e}), using center crop")
+                crop_plan = None
+
+        if not crop_plan or not crop_plan.get("segments"):
+            crop_w = round(video_height * 9 / 16)
+            crop_x = crop_x_override
+            if crop_x is None:
+                crop_x = round((video_width - crop_w) / 2)
+            else:
+                crop_x = min(crop_x, video_width - crop_w)
+            crop_plan = {
+                "videoWidth": video_width,
+                "videoHeight": video_height,
+                "segments": [{
+                    "startTime": 0,
+                    "endTime": duration,
+                    "mode": "center" if crop_x_override is None else "single",
+                    "cropX": crop_x
+                }]
+            }
 
     # ── Silence detection & removal ──
     speaking_segs = None

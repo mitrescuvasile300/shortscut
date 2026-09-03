@@ -166,7 +166,8 @@ export const processJobOnServer = action({
           end_time: clip.endTime,
           ass_subtitles: assContent,
           remove_silence: true,
-          crop_plan: null, // center crop by default (face tracking is browser-only)
+          crop_plan: null,
+          auto_face_track: true, // VPS runs its own face detection/tracking (vps/face_tracking.py)
         };
       });
 
