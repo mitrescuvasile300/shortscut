@@ -45,9 +45,63 @@ WHISPER_PARALLEL = 6   # concurrent Whisper chunk uploads
 SCAN_PARALLEL = 4      # concurrent GPT section scans
 
 # ── Silence removal constants ────────────────────────────────────
-SILENCE_THRESHOLD_DB = -30   # dB below which audio is considered silent
-MIN_SILENCE_DURATION = 0.8   # seconds — silences shorter than this are kept
-SILENCE_PADDING = 0.12       # seconds kept at each cut boundary for natural transitions
+SILENCE_THRESHOLD_DB = -28   # dB below which audio is considered silent
+MIN_SILENCE_DURATION = 0.45  # seconds — silences shorter than this are kept
+SILENCE_PADDING = 0.08       # seconds kept at each cut boundary for natural transitions
+
+# ── Pacing / background music ────────────────────────────────────
+PLAYBACK_SPEED = float(os.environ.get("SHORTSCUT_SPEED", "1.1"))        # 1.0 = original tempo
+MUSIC_VOLUME = float(os.environ.get("SHORTSCUT_MUSIC_VOLUME", "0.12"))  # 0 disables music
+MUSIC_DIR = Path(os.environ.get("SHORTSCUT_MUSIC_DIR") or (Path(__file__).resolve().parent / "music"))
+# Mixkit Stock Music Free License — free for commercial use, no attribution needed.
+MUSIC_TRACKS = {
+    "serene_view.mp3": "https://assets.mixkit.co/music/443/443.mp3",
+    "sweet_september.mp3": "https://assets.mixkit.co/music/282/282.mp3",
+    "digital_clouds.mp3": "https://assets.mixkit.co/music/175/175.mp3",
+    "sleepy_cat.mp3": "https://assets.mixkit.co/music/135/135.mp3",
+    "curiosity.mp3": "https://assets.mixkit.co/music/480/480.mp3",
+    "pop_05.mp3": "https://assets.mixkit.co/music/695/695.mp3",
+}
+
+
+def ensure_music_tracks() -> list[Path]:
+    """Return the local background-music pool (downloads missing tracks once)."""
+    if MUSIC_VOLUME <= 0:
+        return []
+    import urllib.request
+    MUSIC_DIR.mkdir(parents=True, exist_ok=True)
+    for name, url in MUSIC_TRACKS.items():
+        dst = MUSIC_DIR / name
+        if dst.exists() and dst.stat().st_size > 100_000:
+            continue
+        try:
+            print(f"   🎵 downloading music: {name}")
+            urllib.request.urlretrieve(url, dst)
+        except Exception as e:
+            print(f"   ⚠️  music download failed ({name}): {e}")
+            dst.unlink(missing_ok=True)
+    return sorted(p for p in MUSIC_DIR.glob("*.mp3") if p.stat().st_size > 100_000)
+
+
+def _pacing_filters(v_in: str, a_in: str, final_dur: float, has_music: bool) -> tuple[str, str, str]:
+    """Speed-up (video+audio) and optional background music mix, applied after
+    subtitles are burned so the ASS timeline stays untouched.
+    Returns (filter_fragment, v_label, a_label)."""
+    parts = []
+    v_label, a_label = f"[{v_in}]", f"[{a_in}]"
+    if abs(PLAYBACK_SPEED - 1.0) > 1e-3:
+        parts.append(f"[{v_in}]setpts=PTS/{PLAYBACK_SPEED:.3f}[vsp]")
+        parts.append(f"[{a_in}]atempo={PLAYBACK_SPEED:.3f}[asp]")
+        v_label, a_label = "[vsp]", "[asp]"
+    if has_music:
+        fade = min(1.5, final_dur / 4)
+        parts.append(
+            f"[1:a]volume={MUSIC_VOLUME:.3f},afade=t=in:d={fade:.2f},"
+            f"afade=t=out:st={max(0.0, final_dur - fade):.2f}:d={fade:.2f}[bgm]"
+        )
+        parts.append(f"{a_label}[bgm]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[amix]")
+        a_label = "[amix]"
+    return ";".join(parts), v_label, a_label
 
 
 # ─────────────────────────── venv bootstrap ──────────────────────
@@ -2054,6 +2108,9 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
     # Generate shorts
     print(f"\n✂️  Step 5/5: Cutting {len(clips)} shorts...")
     output_files = []
+    music_pool = ensure_music_tracks()
+    if MUSIC_VOLUME > 0 and not music_pool:
+        print("  ⚠️  no background music available — rendering without music")
 
     for i, clip in enumerate(clips):
         start = clip["startTime"]
@@ -2084,7 +2141,7 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
         clip_silences = silence_results[i]
         total_silence = sum(e - s for s, e in clip_silences)
         speaking_segs = None
-        if clip_silences and total_silence > 0.8:
+        if clip_silences and total_silence > 0.4:
             segs = build_speaking_segments(clip_silences, dur)
             if len(segs) > 1:
                 speaking_segs = segs
@@ -2118,6 +2175,19 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
         if n_layouts > 1:
             print(f"     🎬 {n_layouts} framings across {len(pieces)} pieces")
 
+        # ── Pacing + background music ───────────────────────────────
+        out_dur = sum(e - s for s, e, _ in time_segs)
+        final_dur = out_dur / PLAYBACK_SPEED
+        music_track = music_pool[i % len(music_pool)] if music_pool else None
+        music_inputs = ["-stream_loop", "-1", "-i", str(music_track)] if music_track else []
+        extras = []
+        if abs(PLAYBACK_SPEED - 1.0) > 1e-3:
+            extras.append(f"⏩ {PLAYBACK_SPEED:g}x")
+        if music_track:
+            extras.append(f"🎵 {music_track.stem} @ {int(MUSIC_VOLUME * 100)}%")
+        if extras:
+            print(f"     {' · '.join(extras)} → {final_dur:.1f}s")
+
         success = False
         simple = (
             len(pieces) == 1
@@ -2137,14 +2207,20 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
                 fc = _layout_filter("0:v", "v", layout, 0.0, src_w, src_h, crop_w, out_w, out_h)
                 if sub_filter_name:
                     fc += f";[v]{sub_filter_name}={ass_esc}[vout]"
-                    v_label = "[vout]"
+                    v_in = "vout"
                 else:
-                    v_label = "[v]"
+                    v_in = "v"
+                pf, v_label, a_label = _pacing_filters(v_in, "0:a", final_dur, music_track is not None)
+                if pf:
+                    fc += ";" + pf
                 cmd = [
                     "ffmpeg", "-y",
-                    "-ss", str(start), "-i", str(video_path), "-t", str(dur),
+                    # -t as an INPUT option: the source is cut to the clip before
+                    # speed-up, otherwise 1.1x would pull in extra footage.
+                    "-ss", str(start), "-t", str(dur), "-i", str(video_path),
+                    *music_inputs,
                     "-filter_complex", fc,
-                    "-map", v_label, "-map", "0:a?",
+                    "-map", v_label, "-map", a_label,
                 ]
             else:
                 n_p = len(pieces)
@@ -2165,14 +2241,20 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
                 fc_parts.append(f"{concat_in}concat=n={n_p}:v=1:a=1[cv][ca]")
                 if sub_filter_name:
                     fc_parts.append(f"[cv]{sub_filter_name}={ass_esc}[fv]")
-                    v_label = "[fv]"
+                    v_in = "fv"
                 else:
-                    v_label = "[cv]"
+                    v_in = "cv"
+                pf, v_label, a_label = _pacing_filters(v_in, "ca", final_dur, music_track is not None)
+                if pf:
+                    fc_parts.append(pf)
                 cmd = [
                     "ffmpeg", "-y",
-                    "-ss", str(start), "-i", str(video_path), "-t", str(dur),
+                    # -t as an INPUT option: the source is cut to the clip before
+                    # speed-up, otherwise 1.1x would pull in extra footage.
+                    "-ss", str(start), "-t", str(dur), "-i", str(video_path),
+                    *music_inputs,
                     "-filter_complex", ";".join(fc_parts),
-                    "-map", v_label, "-map", "[ca]",
+                    "-map", v_label, "-map", a_label,
                 ]
 
             cmd += [
