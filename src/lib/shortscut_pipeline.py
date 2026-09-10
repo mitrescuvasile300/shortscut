@@ -50,8 +50,8 @@ MIN_SILENCE_DURATION = 0.45  # seconds — silences shorter than this are kept
 SILENCE_PADDING = 0.08       # seconds kept at each cut boundary for natural transitions
 
 # ── Pacing / background music ────────────────────────────────────
-PLAYBACK_SPEED = float(os.environ.get("SHORTSCUT_SPEED", "1.1"))        # 1.0 = original tempo
-MUSIC_VOLUME = float(os.environ.get("SHORTSCUT_MUSIC_VOLUME", "0.12"))  # 0 disables music
+PLAYBACK_SPEED = float(os.environ.get("SHORTSCUT_SPEED", "1.07"))        # 1.0 = original tempo
+MUSIC_VOLUME = float(os.environ.get("SHORTSCUT_MUSIC_VOLUME", "0.08"))  # 0 disables music
 MUSIC_DIR = Path(os.environ.get("SHORTSCUT_MUSIC_DIR") or (Path(__file__).resolve().parent / "music"))
 # Mixkit Stock Music Free License — free for commercial use, no attribution needed.
 MUSIC_TRACKS = {
