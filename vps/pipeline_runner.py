@@ -72,10 +72,35 @@ def _write_cookies(cookies_text: str, dest: Path) -> str | None:
     return str(path)
 
 
+def _download_music(url: str, dest: Path) -> Path:
+    """Fetch the user's background track (any ffmpeg-readable audio, max 50 MB)."""
+    import urllib.request
+    path = dest / "music_custom"
+    req = urllib.request.Request(url, headers={"User-Agent": "shortscut-vps/1.0"})
+    with urllib.request.urlopen(req, timeout=120) as r, open(path, "wb") as f:
+        total = 0
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 50 * 1024 * 1024:
+                raise RuntimeError("music file exceeds 50 MB")
+            f.write(chunk)
+    if total < 1_000:
+        raise RuntimeError("music file is empty")
+    return path
+
+
 def start(work_dir: Path, *, youtube_url: str, api_key: str, language: str,
           num_shorts: int, min_duration: int, max_duration: int,
-          cookies_text: str | None = None, gpt_model: str | None = None) -> str:
-    """Spawn the script. Returns the pipeline id."""
+          cookies_text: str | None = None, gpt_model: str | None = None,
+          music_mode: str | None = None, music_url: str | None = None,
+          music_volume: float | None = None) -> str:
+    """Spawn the script. Returns the pipeline id.
+
+    music_mode: "none" (default) | "default" (built-in royalty-free pool) |
+    "custom" (download music_url into the job dir and use it)."""
     if not SCRIPT.exists():
         raise RuntimeError(f"{SCRIPT} missing on the VPS")
     pid = uuid.uuid4().hex[:12]
@@ -99,6 +124,15 @@ def start(work_dir: Path, *, youtube_url: str, api_key: str, language: str,
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
     if gpt_model and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", gpt_model):
         env["SHORTSCUT_GPT_MODEL"] = gpt_model  # script default: gpt-5.6-sol
+    env["SHORTSCUT_MUSIC_VOLUME"] = "0"
+    if music_mode in ("default", "custom"):
+        vol = music_volume if (music_volume is not None and 0 < music_volume <= 1) else 0.08
+        if music_mode == "custom":
+            if not music_url:
+                raise RuntimeError("music_mode=custom requires music_url")
+            music_path = _download_music(music_url, job_dir)
+            env["SHORTSCUT_MUSIC_FILE"] = str(music_path)
+        env["SHORTSCUT_MUSIC_VOLUME"] = f"{vol:.3f}"
     # Run through a tiny shell wrapper so the exit code lands on disk even if
     # server.py is restarted mid-job; start_new_session detaches the job from
     # the server's process group (systemd KillMode=process leaves it alive).

@@ -51,7 +51,10 @@ SILENCE_PADDING = 0.08       # seconds kept at each cut boundary for natural tra
 
 # ── Pacing / background music ────────────────────────────────────
 PLAYBACK_SPEED = float(os.environ.get("SHORTSCUT_SPEED", "1.07"))        # 1.0 = original tempo
-MUSIC_VOLUME = float(os.environ.get("SHORTSCUT_MUSIC_VOLUME", "0.08"))  # 0 disables music
+# Background music is OFF by default. Enable with SHORTSCUT_MUSIC_VOLUME>0 (e.g. 0.08);
+# SHORTSCUT_MUSIC_FILE=<audio file> uses your own track instead of the built-in pool.
+MUSIC_VOLUME = float(os.environ.get("SHORTSCUT_MUSIC_VOLUME", "0"))  # 0 disables music
+MUSIC_FILE = os.environ.get("SHORTSCUT_MUSIC_FILE") or None
 MUSIC_DIR = Path(os.environ.get("SHORTSCUT_MUSIC_DIR") or (Path(__file__).resolve().parent / "music"))
 # Mixkit Stock Music Free License — free for commercial use, no attribution needed.
 MUSIC_TRACKS = {
@@ -68,6 +71,11 @@ def ensure_music_tracks() -> list[Path]:
     """Return the local background-music pool (downloads missing tracks once)."""
     if MUSIC_VOLUME <= 0:
         return []
+    if MUSIC_FILE:
+        f = Path(MUSIC_FILE)
+        if f.exists() and f.stat().st_size > 1_000:
+            return [f]
+        print(f"  ⚠️  custom music file missing/empty ({MUSIC_FILE}) — using built-in pool")
     import urllib.request
     MUSIC_DIR.mkdir(parents=True, exist_ok=True)
     for name, url in MUSIC_TRACKS.items():

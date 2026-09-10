@@ -956,7 +956,8 @@ class Handler(BaseHTTPRequestHandler):
         # Process a full job (download + all clips)
         # Run the exact local script (shortscut_pipeline.py) end-to-end.
         # Body: youtube_url, openai_api_key, language, num_shorts,
-        #       min_duration, max_duration, cookies (optional)
+        #       min_duration, max_duration, cookies (optional),
+        #       music_mode none|default|custom, music_url (custom), music_volume 0-1
         if self.path == "/pipeline":
             try:
                 body = json.loads(self._read_body())
@@ -977,6 +978,9 @@ class Handler(BaseHTTPRequestHandler):
                     max_duration=int(body.get("max_duration") or 300),
                     cookies_text=body.get("cookies"),
                     gpt_model=body.get("gpt_model") or None,
+                    music_mode=body.get("music_mode") or "none",
+                    music_url=body.get("music_url") or None,
+                    music_volume=float(body["music_volume"]) if body.get("music_volume") is not None else None,
                 )
                 log.info(f"[pipeline {pid}] started for {url}")
                 self._json_response(200, {"success": True, "pipeline_id": pid})
