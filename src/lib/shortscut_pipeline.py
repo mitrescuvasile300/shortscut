@@ -48,6 +48,7 @@ SCAN_PARALLEL = 4      # concurrent GPT section scans
 SILENCE_THRESHOLD_DB = -28   # dB below which audio is considered silent
 MIN_SILENCE_DURATION = 0.45  # seconds — silences shorter than this are kept
 SILENCE_PADDING = 0.08       # seconds kept at each cut boundary for natural transitions
+END_TAIL = 1.0               # seconds of breathing room kept after the last word of a short
 
 # ── Pacing / background music ────────────────────────────────────
 PLAYBACK_SPEED = float(os.environ.get("SHORTSCUT_SPEED", "1.07"))        # 1.0 = original tempo
@@ -1791,11 +1792,13 @@ def build_speaking_segments(silences: list[tuple[float, float]], clip_duration: 
     last_end = 0.0
 
     for s_start, s_end in merged:
-        seg_end = min(s_start + padding, clip_duration)
+        # trailing silence: keep END_TAIL after the last word instead of cutting it
+        tail = END_TAIL if s_end >= clip_duration - 0.1 else padding
+        seg_end = min(s_start + tail, clip_duration)
         if seg_end - last_end > 0.05:
             segments.append((last_end, seg_end, out_t))
             out_t += seg_end - last_end
-        last_end = max(s_end - padding, last_end)
+        last_end = clip_duration if tail == END_TAIL else max(s_end - padding, last_end)
 
     if clip_duration - last_end > 0.05:
         segments.append((last_end, clip_duration, out_t))
@@ -2055,6 +2058,20 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
     )
     dims = result.stdout.strip().split("x")
     src_w, src_h = int(dims[0]), int(dims[1])
+
+    # Give every short END_TAIL seconds of breathing room at the end so the
+    # last sentence doesn't get chopped (clip ends were landing ~1 s too early).
+    src_dur = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(video_path)],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    src_dur_f = float(src_dur) if src_dur else None
+    for clip in clips:
+        new_end = clip["endTime"] + END_TAIL
+        if src_dur_f is not None:
+            new_end = min(new_end, src_dur_f)
+        clip["endTime"] = new_end
 
     # 9:16 crop dimensions
     crop_w = int(src_h * 9 / 16)
