@@ -1,6 +1,7 @@
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { v } from "convex/values";
 import { api, internal } from "./_generated/api";
+import type { Id } from "./_generated/dataModel";
 import {
   action,
   internalAction,
@@ -1039,6 +1040,7 @@ export const updateJobStatus = internalMutation({
       if (value !== undefined) cleanUpdates[key] = value;
     }
     if (clearError) cleanUpdates.error = undefined;
+    cleanUpdates.updatedAt = Date.now();
     await ctx.db.patch(jobId, cleanUpdates);
     return null;
   },
@@ -2113,6 +2115,8 @@ export const getJobInternal = internalQuery({
       audioDownloadUrl: v.optional(v.string()),
       transcriptSegments: v.optional(v.string()),
       vpsPipelineId: v.optional(v.string()),
+      musicMode: v.optional(v.string()),
+      musicStorageId: v.optional(v.id("_storage")),
     }),
     v.null(),
   ),
@@ -2122,6 +2126,8 @@ export const getJobInternal = internalQuery({
     return {
       _id: job._id,
       vpsPipelineId: job.vpsPipelineId,
+      musicMode: job.musicMode,
+      musicStorageId: job.musicStorageId,
       userId: job.userId,
       videoUrl: job.videoUrl,
       videoTitle: job.videoTitle,
@@ -2278,3 +2284,36 @@ export const listFailedPulls = internalQuery({
   },
 });
 
+
+// Watchdog: VPS jobs that are still "in progress" in the DB but have had no
+// status heartbeat for `staleMs` (the polling action died, e.g. OOM while
+// pulling a big MP4). Convex actions are not retried automatically.
+export const listStuckJobs = internalQuery({
+  args: { staleMs: v.number() },
+  returns: v.array(
+    v.object({
+      jobId: v.id("jobs"),
+      userId: v.id("users"),
+      pipelineId: v.string(),
+      status: v.string(),
+      lastSeen: v.number(),
+    }),
+  ),
+  handler: async (ctx, { staleMs }) => {
+    const cutoff = Date.now() - staleMs;
+    const out: Array<{ jobId: Id<"jobs">; userId: Id<"users">; pipelineId: string; status: string; lastSeen: number }> = [];
+    for (const status of ["downloading", "transcribing", "analyzing", "generating"] as const) {
+      const rows = await ctx.db
+        .query("jobs")
+        .withIndex("by_status", (q) => q.eq("status", status))
+        .collect();
+      for (const j of rows) {
+        const lastSeen = j.updatedAt ?? j._creationTime;
+        if (j.vpsPipelineId && lastSeen < cutoff) {
+          out.push({ jobId: j._id, userId: j.userId, pipelineId: j.vpsPipelineId, status, lastSeen });
+        }
+      }
+    }
+    return out;
+  },
+});

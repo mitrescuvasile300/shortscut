@@ -31,3 +31,4 @@ bun.lockb
 tmp/
 test-results/
 playwright-report/*.pyc
+vps/__pycache__/

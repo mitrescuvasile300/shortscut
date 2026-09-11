@@ -512,6 +512,17 @@ export function JobDetailPage() {
             </span>
             <span>•</span>
             <span>{job.language.toUpperCase()}</span>
+            {job.musicMode && job.musicMode !== "none" && (
+              <>
+                <span>•</span>
+                <span>
+                  🎵{" "}
+                  {job.musicMode === "custom"
+                    ? job.musicFileName || "muzică proprie"
+                    : "muzică inclusă"}
+                </span>
+              </>
+            )}
           </div>
         </div>
       </div>

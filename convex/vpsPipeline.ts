@@ -86,10 +86,20 @@ export const startPipeline = action({
       // Fresh start: drop clips/shorts from any previous attempt
       await ctx.runMutation(internal.processing.deleteClipsByJob, { jobId });
 
+      const musicMode = job.musicMode === "custom" || job.musicMode === "default" ? job.musicMode : "none";
+      let musicUrl: string | undefined;
+      if (musicMode === "custom") {
+        if (!job.musicStorageId) throw new Error("Lipsește fișierul de muzică încărcat pentru acest job.");
+        musicUrl = (await ctx.storage.getUrl(job.musicStorageId)) ?? undefined;
+        if (!musicUrl) throw new Error("Fișierul de muzică nu mai există în storage.");
+      }
+
       const resp = await vpsFetch("/pipeline", {
         method: "POST",
         body: JSON.stringify({
           youtube_url: job.videoUrl,
+          music_mode: musicMode,
+          music_url: musicUrl,
           openai_api_key: settings.openaiApiKey,
           gpt_model: settings.openaiModel || undefined,
           cookies: settings.youtubeCookies || undefined,
@@ -223,37 +233,89 @@ export const pollPipeline = internalAction({
       return null;
     }
 
-    // ── completed: pull the MP4s into Convex storage ──────────────────
-    const clips = await ctx.runQuery(internal.processing.getClipsInternal, { jobId });
-    // The script names files NN_Title.mp4 in the order of clips.json.
-    // getClipsInternal returns them in insertion order == clips.json order.
-    const byIndex = clips || [];
+    // ── completed: pull the MP4s into Convex storage, one file per action
+    // step (each step is short and saves progress, so a crash never leaves
+    // the job hanging and the watchdog can resume it).
+    await ctx.scheduler.runAfter(0, internal.vpsPipeline.pullOutput, {
+      jobId,
+      userId,
+      pipelineId,
+      index: 0,
+      ok: 0,
+      lastErr: "",
+    });
+    return null;
+  },
+});
 
-    let ok = 0;
-    let lastErr = "";
-    for (const out of st.outputs) {
-      const clip = byIndex[out.index];
-      if (!clip) continue;
+const PULL_TIMEOUT_MS = 8 * 60_000; // VPS → storage upload of one MP4
+
+export const pullOutput = internalAction({
+  args: {
+    jobId: v.id("jobs"),
+    userId: v.id("users"),
+    pipelineId: v.string(),
+    index: v.number(),
+    ok: v.number(),
+    lastErr: v.string(),
+  },
+  returns: v.null(),
+  handler: async (ctx, args) => {
+    const { jobId, userId, pipelineId, index } = args;
+    let { ok, lastErr } = args;
+
+    const fail = async (msg: string) => {
+      await ctx.runMutation(internal.processing.updateJobStatus, { jobId, status: "failed", error: msg });
+    };
+
+    const resp = await vpsFetch(`/pipeline/${pipelineId}`);
+    if (resp.status === 404) {
+      await fail("Fișierele nu mai există pe VPS (au expirat). Rulează procesarea din nou.");
+      return null;
+    }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const st = (await resp.json()) as VpsStatus;
+    const outputs = st.outputs || [];
+
+    if (index >= outputs.length) {
+      if (ok === 0) {
+        await fail(
+          `Scriptul a terminat, dar niciun short nu a putut fi preluat de pe VPS${lastErr ? ` (${lastErr})` : ""}. Fișierele rămân pe VPS 3h — poți reîncerca preluarea.`,
+        );
+        return null;
+      }
+      await ctx.runMutation(internal.processing.updateJobStatus, { jobId, status: "completed", clearError: true });
+      console.log(`[vpsPipeline] job ${jobId}: ${ok}/${outputs.length} shorts stored (${st.elapsed}s on VPS)`);
+      return null;
+    }
+
+    // heartbeat so the watchdog knows we're alive
+    await ctx.runMutation(internal.processing.updateJobStatus, { jobId, status: "generating" });
+
+    const out = outputs[index];
+    const clips = (await ctx.runQuery(internal.processing.getClipsInternal, { jobId })) || [];
+    const clip = clips[out.index];
+    if (clip) {
       try {
-        const fileResp = await fetch(`${VPS_URL}${out.download_url}`);
-        if (!fileResp.ok) throw new Error(`download HTTP ${fileResp.status}`);
-        const blob = await fileResp.blob();
+        // The VPS streams the file directly into Convex storage; the action
+        // never holds the MP4 in memory (85 MB blobs killed the old approach).
         const uploadUrl = await ctx.storage.generateUploadUrl();
-        const up = await fetch(uploadUrl, {
-          method: "POST",
-          headers: { "Content-Type": "video/mp4" },
-          body: blob,
-        });
-        if (!up.ok) throw new Error(`storage upload HTTP ${up.status}`);
-        const { storageId } = (await up.json()) as { storageId: string };
+        const up = await vpsFetch(
+          `/pipeline/${pipelineId}/upload`,
+          { method: "POST", body: JSON.stringify({ name: out.name, upload_url: uploadUrl }) },
+          PULL_TIMEOUT_MS,
+        );
+        if (!up.ok) throw new Error(`VPS upload HTTP ${up.status}: ${(await up.text()).slice(0, 200)}`);
+        const data = (await up.json()) as { success: boolean; storage_id?: string; size?: number; error?: string };
+        if (!data.success || !data.storage_id) throw new Error(data.error || "VPS nu a returnat storageId");
         await ctx.runMutation(internal.processing.upsertShort, {
           clipId: clip._id,
           jobId,
           userId,
-          storageId: storageId as Id<"_storage">,
+          storageId: data.storage_id as Id<"_storage">,
           fileName: out.name,
           duration: clip.endTime - clip.startTime,
-          fileSize: out.size || blob.size,
+          fileSize: out.size || data.size || 0,
           hasSubtitles: true,
         });
         ok++;
@@ -263,19 +325,56 @@ export const pollPipeline = internalAction({
       }
     }
 
-    if (ok === 0) {
-      await fail(
-        `Scriptul a terminat, dar niciun short nu a putut fi preluat de pe VPS${lastErr ? ` (${lastErr})` : ""}. Fișierele rămân pe VPS 3h — poți reîncerca preluarea.`,
-      );
-      return null;
-    }
-    await ctx.runMutation(internal.processing.updateJobStatus, {
+    await ctx.scheduler.runAfter(0, internal.vpsPipeline.pullOutput, {
       jobId,
-      status: "completed",
-      clearError: true,
+      userId,
+      pipelineId,
+      index: index + 1,
+      ok,
+      lastErr,
     });
-    console.log(`[vpsPipeline] job ${jobId}: ${ok}/${st.outputs.length} shorts stored (${st.elapsed}s on VPS)`);
     return null;
+  },
+});
+
+// ── Watchdog (cron, every 5 min): jobs with no heartbeat for 15 min mean the
+// polling/pull action died. Re-attach to the VPS instead of hanging forever.
+export const watchdog = internalAction({
+  args: {},
+  returns: v.number(),
+  handler: async (ctx): Promise<number> => {
+    const stuck = await ctx.runQuery(internal.processing.listStuckJobs, { staleMs: 15 * 60_000 });
+    for (const j of stuck) {
+      const fail = (msg: string) =>
+        ctx.runMutation(internal.processing.updateJobStatus, { jobId: j.jobId, status: "failed", error: msg });
+      try {
+        const resp = await vpsFetch(`/pipeline/${j.pipelineId}`);
+        if (resp.status === 404) {
+          await fail("Jobul s-a blocat și VPS-ul nu îl mai are. Încearcă din nou.");
+          continue;
+        }
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const st = (await resp.json()) as VpsStatus;
+        console.log(`[watchdog] job ${j.jobId} stale (${Math.round((Date.now() - j.lastSeen) / 60000)} min), VPS state=${st.state}`);
+        if (st.state === "failed") {
+          await fail(st.error || "Scriptul a eșuat pe VPS fără mesaj de eroare.");
+        } else {
+          // running → resume polling; completed → re-pull (pollPipeline hands off to pullOutput)
+          await ctx.runMutation(internal.processing.updateJobStatus, { jobId: j.jobId, status: "generating" });
+          await ctx.scheduler.runAfter(0, internal.vpsPipeline.pollPipeline, {
+            jobId: j.jobId,
+            userId: j.userId,
+            pipelineId: j.pipelineId,
+            startedAt: Date.now(),
+            clipsSaved: true,
+          });
+        }
+      } catch (err) {
+        console.error(`[watchdog] job ${j.jobId}:`, err);
+        if (Date.now() - j.lastSeen > 3 * 3600_000) await fail("Jobul s-a blocat și VPS-ul nu răspunde.");
+      }
+    }
+    return stuck.length;
   },
 });
 

@@ -989,6 +989,38 @@ class Handler(BaseHTTPRequestHandler):
                 self._json_response(500, {"error": str(e)})
             return
 
+        # Push a finished short straight into Convex storage (the VPS uploads
+        # the MP4 itself, so Convex never buffers 50-100 MB blobs in memory).
+        # Body: {"name": "<file name>", "upload_url": "<Convex storage upload URL>"}
+        if self.path.startswith("/pipeline/") and self.path.endswith("/upload"):
+            parts = self.path.strip("/").split("/")
+            if len(parts) != 3:
+                self._json_response(404, {"error": "Not found"})
+                return
+            try:
+                body = json.loads(self._read_body())
+                fp = pipeline_runner.file_path(parts[1], body.get("name") or "")
+                upload_url = body.get("upload_url")
+                if not fp or not upload_url:
+                    self._json_response(404, {"error": "File not found or upload_url missing"})
+                    return
+                import urllib.request
+                size = fp.stat().st_size
+                with open(fp, "rb") as f:
+                    req = urllib.request.Request(
+                        upload_url, data=f, method="POST",
+                        headers={"Content-Type": "video/mp4", "Content-Length": str(size)},
+                    )
+                    t0 = time.time()
+                    with urllib.request.urlopen(req, timeout=600) as r:
+                        resp = json.loads(r.read().decode() or "{}")
+                log.info(f"[pipeline {parts[1]}] uploaded {fp.name} ({size/1e6:.1f} MB) to storage in {time.time()-t0:.1f}s")
+                self._json_response(200, {"success": True, "storage_id": resp.get("storageId"), "size": size})
+            except Exception as e:
+                log.error(f"[pipeline {parts[1]}] upload failed: {e}")
+                self._json_response(500, {"error": str(e)})
+            return
+
         if self.path == "/process":
             try:
                 body = json.loads(self._read_body())
