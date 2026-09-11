@@ -2115,6 +2115,7 @@ export const getJobInternal = internalQuery({
       audioDownloadUrl: v.optional(v.string()),
       transcriptSegments: v.optional(v.string()),
       vpsPipelineId: v.optional(v.string()),
+      updatedAt: v.optional(v.number()),
       musicMode: v.optional(v.string()),
       musicStorageId: v.optional(v.id("_storage")),
     }),

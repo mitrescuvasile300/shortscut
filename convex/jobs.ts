@@ -37,6 +37,7 @@ export const list = query({
       musicMode: v.optional(v.union(v.literal("none"), v.literal("default"), v.literal("custom"))),
       musicStorageId: v.optional(v.id("_storage")),
       musicFileName: v.optional(v.string()),
+      updatedAt: v.optional(v.number()),
     })
   ),
   handler: async (ctx) => {
@@ -85,6 +86,7 @@ export const get = query({
       musicMode: v.optional(v.union(v.literal("none"), v.literal("default"), v.literal("custom"))),
       musicStorageId: v.optional(v.id("_storage")),
       musicFileName: v.optional(v.string()),
+      updatedAt: v.optional(v.number()),
     }),
     v.null()
   ),
