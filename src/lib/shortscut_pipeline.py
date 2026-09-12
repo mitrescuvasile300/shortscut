@@ -48,7 +48,8 @@ SCAN_PARALLEL = 4      # concurrent GPT section scans
 SILENCE_THRESHOLD_DB = -28   # dB below which audio is considered silent
 MIN_SILENCE_DURATION = 0.45  # seconds — silences shorter than this are kept
 SILENCE_PADDING = 0.08       # seconds kept at each cut boundary for natural transitions
-END_TAIL = 1.0               # seconds of breathing room kept after the last word of a short
+END_TAIL = 0.5               # seconds of breathing room kept after the last word of a short
+START_LEAD = 0.05            # seconds kept before the first word of a short (start exactly on the hook)
 
 # ── Pacing / background music ────────────────────────────────────
 PLAYBACK_SPEED = float(os.environ.get("SHORTSCUT_SPEED", "1.07"))        # 1.0 = original tempo
@@ -1772,6 +1773,15 @@ def detect_silence(video_path: Path, start_time: float, duration: float,
     return silences
 
 
+def snap_start_to_words(start: float, words: list[dict], window: float = 1.5,
+                        lead: float = START_LEAD) -> float:
+    """Move a clip start onto the first word spoken within `window` seconds after it."""
+    candidates = [w["start"] for w in words if start - 0.1 <= w["start"] <= start + window]
+    if not candidates:
+        return start
+    return round(max(min(candidates) - lead, 0.0), 3)
+
+
 def build_speaking_segments(silences: list[tuple[float, float]], clip_duration: float,
                             padding: float = SILENCE_PADDING
                             ) -> list[tuple[float, float, float]]:
@@ -1795,6 +1805,8 @@ def build_speaking_segments(silences: list[tuple[float, float]], clip_duration: 
         # trailing silence: keep END_TAIL after the last word instead of cutting it
         tail = END_TAIL if s_end >= clip_duration - 0.1 else padding
         seg_end = min(s_start + tail, clip_duration)
+        if s_start < 0.1:
+            seg_end = last_end  # leading silence: start straight on the first word
         if seg_end - last_end > 0.05:
             segments.append((last_end, seg_end, out_t))
             out_t += seg_end - last_end
@@ -2067,7 +2079,14 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
         capture_output=True, text=True,
     ).stdout.strip()
     src_dur_f = float(src_dur) if src_dur else None
+    words = transcript.get("words") or []
     for clip in clips:
+        # Start exactly on the hook: transcript timestamps are floored to whole
+        # seconds, so snap the start to the first spoken word at/after it.
+        snapped = snap_start_to_words(clip["startTime"], words)
+        if snapped != clip["startTime"]:
+            print(f"  ⏩ Clip start {clip['startTime']:.2f}s → {snapped:.2f}s (first word)")
+            clip["startTime"] = snapped
         new_end = clip["endTime"] + END_TAIL
         if src_dur_f is not None:
             new_end = min(new_end, src_dur_f)
