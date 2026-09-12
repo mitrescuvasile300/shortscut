@@ -48,7 +48,7 @@ SCAN_PARALLEL = 4      # concurrent GPT section scans
 SILENCE_THRESHOLD_DB = -28   # dB below which audio is considered silent
 MIN_SILENCE_DURATION = 0.45  # seconds — silences shorter than this are kept
 SILENCE_PADDING = 0.08       # seconds kept at each cut boundary for natural transitions
-END_TAIL = 0.5               # seconds of breathing room kept after the last word of a short
+END_TAIL = 0.3               # seconds kept after the END of the last word (word ends are snapped, see snap_end_to_words)
 START_LEAD = 0.05            # seconds kept before the first word of a short (start exactly on the hook)
 
 # ── Pacing / background music ────────────────────────────────────
@@ -1232,6 +1232,10 @@ print(json.dumps({{"results": results, "yunet": yn_count, "mp": mp_count, "haar"
     # person). So: detect the cuts, decide the framing PER SHOT, and let
     # generate_shorts() switch layouts at every cut.
     cuts = detect_scene_cuts(video_path, start_time, duration)
+    # Softer cuts (same set, different angle) don't reach the 0.30 threshold;
+    # tracking uses them to place its crop jumps on the real frame of the cut
+    # instead of ramping towards it from the previous 0.5 s sample.
+    soft_cuts = detect_scene_cuts(video_path, start_time, duration, threshold=0.12)
     bounds = [0.0] + [c for c in cuts if 0.0 < c < duration] + [duration]
     shots: list[tuple[float, float]] = []
     for a, b in zip(bounds, bounds[1:]):
@@ -1244,7 +1248,7 @@ print(json.dumps({{"results": results, "yunet": yn_count, "mp": mp_count, "haar"
         shots.pop(0)
 
     if len(shots) == 1:
-        return _plan_crop_for_frames(raw, fps_sample, src_w, crop_w)
+        return _plan_crop_for_frames(raw, fps_sample, src_w, crop_w, soft_cuts=soft_cuts)
 
     print(f"    🎬 {len(shots)} camera shots detected")
     segments = []
@@ -1257,7 +1261,8 @@ print(json.dumps({{"results": results, "yunet": yn_count, "mp": mp_count, "haar"
         else:
             # Within one shot a two-person framing is stable, so 60% of the
             # face-frames showing both people is enough to call it dual.
-            plan = _plan_crop_for_frames(sub, fps_sample, src_w, crop_w, dual_consistency=0.6)
+            plan = _plan_crop_for_frames(sub, fps_sample, src_w, crop_w, dual_consistency=0.6,
+                                         soft_cuts=[c - s0 for c in soft_cuts if s0 < c < s1])
         if plan["mode"] == "tracking":
             plan["keyframes"] = [(round(t + s0, 2), x) for (t, x) in plan["keyframes"]]
         seg = {"start": round(s0, 3), "end": round(s1, 3), **plan}
@@ -1307,7 +1312,8 @@ def detect_scene_cuts(video_path: Path, start_time: float, duration: float,
 
 
 def _plan_crop_for_frames(raw: list, fps_sample: float, src_w: int, crop_w: int,
-                          dual_consistency: float = 0.85) -> dict:
+                          dual_consistency: float = 0.85,
+                          soft_cuts: list[float] | None = None) -> dict:
     """Decide the 9:16 framing for ONE camera shot from its per-frame face lists.
 
     raw: list (one entry per sampled frame) of face lists [{x,y,w,h,score}] or None.
@@ -1625,6 +1631,7 @@ def _plan_crop_for_frames(raw: list, fps_sample: float, src_w: int, crop_w: int,
     cam_x = None
     last_moved = -1
     last_valid = -1
+    cut_frames: list[int] = []   # sample indices where the crop jumps (camera cut)
 
     for i in range(n):
         head = filled[i]
@@ -1647,6 +1654,8 @@ def _plan_crop_for_frames(raw: list, fps_sample: float, src_w: int, crop_w: int,
                 elif prev_a is None or cur_a is None:
                     is_cut = True
         if cam_x is None or is_cut:
+            if cam_x is not None:
+                cut_frames.append(i)
             cam_x = head
             cam[i] = cam_x
             last_valid = i
@@ -1699,6 +1708,11 @@ def _plan_crop_for_frames(raw: list, fps_sample: float, src_w: int, crop_w: int,
         if abs(x - keyframes[-1][1]) > epsilon or idx == valid_idx[-1]:
             keyframes.append((t, x))
 
+    # Camera cuts must be a hard STEP on the exact frame of the cut, not a
+    # ramp that starts 0.5 s early (the previous sample). Place the step on
+    # the nearest scene-cut timestamp between the two samples, if we have one.
+    keyframes = _step_keyframes_at_cuts(keyframes, cut_frames, crop_positions, dt, soft_cuts or [])
+
     xs_only = [x for (_, x) in keyframes]
     rng_val = max(xs_only) - min(xs_only)
     # If after smoothing the range is small, fall back to single static
@@ -1709,6 +1723,35 @@ def _plan_crop_for_frames(raw: list, fps_sample: float, src_w: int, crop_w: int,
 
     print(f"    📹 Tracking: {len(keyframes)} keyframes, range {rng_val}px")
     return {"mode": "tracking", "keyframes": keyframes}
+
+
+def _step_keyframes_at_cuts(keyframes: list, cut_frames: list, crop_positions: list,
+                            dt: float, soft_cuts: list[float]) -> list:
+    """Turn the keyframe ramp around each detected camera cut into a hard step."""
+    if not cut_frames:
+        return keyframes
+    kfs = list(keyframes)
+    for i in cut_frames:
+        x_after = crop_positions[i]
+        prev_idx = next((j for j in range(i - 1, -1, -1) if crop_positions[j] is not None), None)
+        if x_after is None or prev_idx is None:
+            continue
+        x_before = crop_positions[prev_idx]
+        t_prev, t_i = prev_idx * dt, i * dt
+        exact = [c for c in soft_cuts if t_prev < c <= t_i + 0.05]
+        t_cut = min(exact, key=lambda c: abs(c - t_i)) if exact else t_i
+        # drop keyframes inside the ramp window, then add the step
+        kfs = [(t, x) for (t, x) in kfs if not (t_prev < t <= t_i)]
+        kfs.append((round(max(t_cut - 0.04, t_prev), 3), x_before))
+        kfs.append((round(t_cut, 3), x_after))
+    kfs.sort(key=lambda k: k[0])
+    dedup = []
+    for k in kfs:
+        if dedup and abs(dedup[-1][0] - k[0]) < 1e-6:
+            dedup[-1] = k
+        else:
+            dedup.append(k)
+    return dedup
 
 
 def build_tracking_crop_expr(keyframes: list, max_crop_x: int) -> str:
@@ -1732,11 +1775,11 @@ def build_tracking_crop_expr(keyframes: list, max_crop_x: int) -> str:
             dx = int(round(x1 - x0))
             base = int(round(x0))
             if dx >= 0:
-                seg = f"{base}+{dx}*(t-{t0:.2f})/{dt:.2f}"
+                seg = f"{base}+{dx}*(t-{t0:.3f})/{dt:.3f}"
             else:
-                seg = f"{base}-{abs(dx)}*(t-{t0:.2f})/{dt:.2f}"
+                seg = f"{base}-{abs(dx)}*(t-{t0:.3f})/{dt:.3f}"
         # Escape commas for ffmpeg filter context
-        expr = f"if(lt(t\\,{t1:.2f})\\,{seg}\\,{expr})"
+        expr = f"if(lt(t\\,{t1:.3f})\\,{seg}\\,{expr})"
 
     # Clamp to valid range
     expr = f"clip({expr}\\,0\\,{max_crop_x})"
@@ -1780,6 +1823,14 @@ def snap_start_to_words(start: float, words: list[dict], window: float = 1.5,
     if not candidates:
         return start
     return round(max(min(candidates) - lead, 0.0), 3)
+
+
+def snap_end_to_words(end: float, words: list[dict], window: float = 1.0) -> float:
+    """Move a clip end onto the end of the last word finishing within `window` s after it."""
+    candidates = [w["end"] for w in words if end - 1.5 <= w["end"] <= end + window]
+    if not candidates:
+        return end
+    return round(max(candidates), 3)
 
 
 def build_speaking_segments(silences: list[tuple[float, float]], clip_duration: float,
@@ -2087,7 +2138,11 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
         if snapped != clip["startTime"]:
             print(f"  ⏩ Clip start {clip['startTime']:.2f}s → {snapped:.2f}s (first word)")
             clip["startTime"] = snapped
-        new_end = clip["endTime"] + END_TAIL
+        # Stop exactly where the last word ends (+END_TAIL so it doesn't clip).
+        snapped_end = snap_end_to_words(clip["endTime"], words)
+        if snapped_end != clip["endTime"]:
+            print(f"  ⏹ Clip end {clip['endTime']:.2f}s → {snapped_end:.2f}s (last word)")
+        new_end = snapped_end + END_TAIL
         if src_dur_f is not None:
             new_end = min(new_end, src_dur_f)
         clip["endTime"] = new_end
