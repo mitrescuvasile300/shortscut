@@ -873,7 +873,21 @@ export function JobDetailPage() {
                                 </Badge>
                               )}
                             </div>
-                            <h3 className="font-semibold">{clip.title}</h3>
+                            <div className="flex items-start gap-2">
+                              <h3 className="font-semibold leading-snug">{clip.title}</h3>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-6 px-1.5 text-xs shrink-0"
+                                title="Copiază titlul pentru YouTube Shorts"
+                                onClick={e => {
+                                  e.stopPropagation();
+                                  copyToClipboard(clip.title, "Titlu");
+                                }}
+                              >
+                                <ClipboardCopy className="size-3" />
+                              </Button>
+                            </div>
                             <p className="text-sm text-muted-foreground mt-1 line-clamp-1">
                               {clip.reason}
                             </p>
@@ -944,6 +958,38 @@ export function JobDetailPage() {
                             <blockquote className="text-sm italic border-l-2 border-primary/40 pl-3">
                               "{clip.hookLine || clip.transcriptExcerpt}"
                             </blockquote>
+                          </div>
+
+                          {/* YouTube Shorts title */}
+                          <div>
+                            <div className="flex items-center justify-between mb-1.5">
+                              <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+                                Titlu YouTube Shorts
+                              </div>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 text-xs"
+                                onClick={e => {
+                                  e.stopPropagation();
+                                  copyToClipboard(
+                                    clip.hashtags && clip.hashtags.length > 0
+                                      ? `${clip.title} ${clip.hashtags.slice(0, 2).join(" ")}`
+                                      : clip.title,
+                                    "Titlu",
+                                  );
+                                }}
+                              >
+                                <ClipboardCopy className="size-3 mr-1" />
+                                Copiază cu hashtag-uri
+                              </Button>
+                            </div>
+                            <p className="text-sm font-semibold bg-background rounded-lg p-3 border">
+                              {clip.title}
+                              <span className="ml-2 text-xs font-normal text-muted-foreground">
+                                {clip.title.length} caractere
+                              </span>
+                            </p>
                           </div>
 
                           {/* Caption */}

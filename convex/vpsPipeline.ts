@@ -29,6 +29,9 @@ interface VpsClip {
   endTime: number;
   viralScore: number;
   reason?: string;
+  caption?: string;
+  hashtags?: string[];
+  workingTitle?: string;
 }
 
 interface VpsStatus {
@@ -196,14 +199,15 @@ export const pollPipeline = internalAction({
         userId,
         clips: st.clips.map(c => ({
           title: c.title,
-          description: c.reason || "",
-          hashtags: [],
+          description: c.caption || c.reason || "",
+          hashtags: Array.isArray(c.hashtags) ? c.hashtags : [],
           startTime: c.startTime,
           endTime: c.endTime,
           transcriptExcerpt: c.hookLine || "",
           viralScore: c.viralScore,
           reason: c.reason || "",
           hookLine: c.hookLine || undefined,
+          caption: c.caption || undefined,
         })),
       });
       clipsSaved = true;

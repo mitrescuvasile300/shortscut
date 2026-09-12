@@ -910,6 +910,115 @@ Candidates:
     return picks
 
 
+# ── YouTube Shorts title writing ─────────────────────────────────────────────
+# Distilled from 2026 Shorts-title research (feed truncates titles at roughly
+# 40-50 chars on mobile; 4-8 word titles dominate trending Shorts; specificity,
+# open loops and one emoji max lift CTR; hashtags go at the END of the title).
+SHORTS_TITLE_RULES = """You write titles for YouTube Shorts. Rules that actually move CTR on Shorts in 2026:
+1. LENGTH: the core title is 25-45 characters (4-8 words). The Shorts feed cuts titles at ~45 chars on phones, so the ENTIRE hook must live there. Hard max 60 chars before hashtags.
+2. FRONT-LOAD: the most surprising/specific word in the first 3 words. Never start with "How", "Why", "The", "A", "In this video", the speaker's name, or the show name.
+3. OPEN LOOP: create a curiosity gap the viewer can only close by watching — tease the outcome, never reveal it. The payoff MUST actually happen in the clip (no lies, no clickbait the clip doesn't deliver).
+4. SPECIFICITY: concrete numbers, names, amounts, places or quotes beat generic words. "3 cuvinte" > "câteva cuvinte"; a real figure > "o sumă mare".
+5. EMOTION/STAKES: pick ONE angle — shock, conflict, secret, mistake, reversal, humor, warning, taboo. State it plainly; clear beats clever.
+6. STYLE: conversational, like a friend texting you. At most ONE word in ALL CAPS, only if it carries the punch. Zero or one emoji, only if it adds meaning. No quotation marks, no colon/pipe separators, no ellipsis, no "(partea 1)".
+7. LANGUAGE: exactly the spoken language of the clip (same slang, same register). Never translate.
+8. HASHTAGS: separate field — exactly 3-5, lowercase, no spaces, first one is #shorts, the rest are the clip's niche + topic (in the clip's language where natural). They are NOT part of the title text.
+9. CAPTION: 1-2 short sentences for the description box that add context or a question that invites comments, ending with the same hashtags.
+10. Every title in a batch must use a different angle/structure — no two titles that start the same way."""
+
+
+def write_shorts_titles(client, clips: list[dict], transcript: dict,
+                        video_title: str, language: str) -> list[dict]:
+    """Give every selected clip a catchy, Shorts-optimised title + caption + hashtags.
+
+    Runs after clip selection so the model sees the *actual* words of each
+    clip (not just the scan summary) and can write a title the clip delivers on.
+    """
+    if not clips:
+        return clips
+    print(f"\n✍️  Writing YouTube Shorts titles for {len(clips)} clips...")
+
+    words = transcript.get("words") or []
+    segments = transcript.get("segments") or []
+
+    def _excerpt(c: dict, limit: int = 1800) -> str:
+        s0, s1 = float(c["startTime"]), float(c["endTime"])
+        if words:
+            txt = " ".join(w["word"].strip() for w in words if s0 <= float(w["start"]) <= s1)
+        else:
+            txt = " ".join(seg["text"].strip() for seg in segments
+                           if float(seg["end"]) >= s0 and float(seg["start"]) <= s1)
+        return (txt or c.get("hookLine", ""))[:limit]
+
+    blocks = []
+    for i, c in enumerate(clips, 1):
+        blocks.append(
+            f'CLIP {i} | {int(c["endTime"] - c["startTime"])}s | working title: "{c.get("title", "")}"\n'
+            f'hook: "{c.get("hookLine", "")[:160]}"\n'
+            f'why viral: {c.get("reason", "")[:200]}\n'
+            f'transcript: {_excerpt(c)}'
+        )
+
+    properties = {}
+    for i in range(1, len(clips) + 1):
+        properties[f"clip{i}_title"] = {"type": "string", "description": f"Final YouTube Shorts title for clip {i}, 25-45 chars, no hashtags"}
+        properties[f"clip{i}_caption"] = {"type": "string", "description": f"1-2 sentence description for clip {i} ending with hashtags"}
+        properties[f"clip{i}_hashtags"] = {"type": "array", "items": {"type": "string"}, "description": "3-5 hashtags, first is #shorts"}
+
+    try:
+        response = client.chat.completions.create(
+            model=GPT_MODEL,
+            messages=[
+                {"role": "system", "content": SHORTS_TITLE_RULES},
+                {"role": "user", "content": (
+                    f'Source video: "{video_title}". Spoken language code: {language}.\n'
+                    f"Write the final YouTube Shorts title, caption and hashtags for each of the {len(clips)} clips below. "
+                    f"Titles must be in the clip's spoken language and must be deliverable by the transcript shown.\n\n"
+                    + "\n\n".join(blocks)
+                )},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "shorts_titles",
+                    "strict": False,
+                    "schema": {"type": "object", "properties": properties},
+                },
+            },
+            **_GPT_EXTRA,
+        )
+        data = json.loads(response.choices[0].message.content)
+    except Exception as e:
+        print(f"  ⚠️  Title writing failed: {e} — keeping working titles")
+        return clips
+
+    out = []
+    for i, c in enumerate(clips, 1):
+        title = str(data.get(f"clip{i}_title") or "").strip().strip('"').strip()
+        # Strip hashtags that leaked into the title; enforce the 60-char ceiling.
+        title = re.sub(r"\s*#\w+", "", title).strip()
+        if len(title) > 60:
+            cut = title[:60]
+            title = cut[:cut.rfind(" ")] if " " in cut else cut
+        tags = [t if t.startswith("#") else f"#{t}" for t in (data.get(f"clip{i}_hashtags") or [])
+                if isinstance(t, str) and t.strip()]
+        tags = [re.sub(r"[^\w#]", "", t.lower()) for t in tags][:5]
+        if tags and tags[0] != "#shorts":
+            tags = ["#shorts"] + [t for t in tags if t != "#shorts"]
+        tags = tags[:5]
+        caption = str(data.get(f"clip{i}_caption") or "").strip()
+        new_c = {**c, "workingTitle": c.get("title", "")}
+        if title:
+            new_c["title"] = title
+        if caption:
+            new_c["caption"] = caption
+        if tags:
+            new_c["hashtags"] = tags
+        print(f'  {i}. {new_c["title"]}  ({len(new_c["title"])} chars)  {" ".join(tags)}')
+        out.append(new_c)
+    return out
+
+
 def analyze_transcript(api_key: str, transcript: dict, video_title: str,
                        language: str, num_shorts: int) -> list[dict]:
     """Full two-pass AI analysis: scan chunks → dedupe → select best."""
@@ -956,6 +1065,10 @@ def analyze_transcript(api_key: str, transcript: dict, video_title: str,
 
     # Final timestamp correction pass
     selected = correct_timestamps(transcript["text"], selected)
+
+    # Catchy YouTube Shorts titles + captions + hashtags, written from the
+    # actual words of each clip.
+    selected = write_shorts_titles(client, selected, transcript, video_title, language)
 
     print(f"\n✅ Selected {len(selected)} clips:")
     for i, clip in enumerate(selected):
