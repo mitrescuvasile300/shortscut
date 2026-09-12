@@ -48,7 +48,7 @@ SCAN_PARALLEL = 4      # concurrent GPT section scans
 SILENCE_THRESHOLD_DB = -28   # dB below which audio is considered silent
 MIN_SILENCE_DURATION = 0.45  # seconds — silences shorter than this are kept
 SILENCE_PADDING = 0.08       # seconds kept at each cut boundary for natural transitions
-END_TAIL = 0.3               # seconds kept after the END of the last word (word ends are snapped, see snap_end_to_words)
+END_TAIL = 0.0               # seconds kept after the END of the last word (0 = stop exactly on the last word)
 START_LEAD = 0.05            # seconds kept before the first word of a short (start exactly on the hook)
 
 # ── Pacing / background music ────────────────────────────────────
@@ -2122,8 +2122,8 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
     dims = result.stdout.strip().split("x")
     src_w, src_h = int(dims[0]), int(dims[1])
 
-    # Give every short END_TAIL seconds of breathing room at the end so the
-    # last sentence doesn't get chopped (clip ends were landing ~1 s too early).
+    # Snap clip bounds to real word timestamps so shorts start on the hook and
+    # stop exactly on the last word (transcript timestamps are whole seconds).
     src_dur = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "csv=p=0", str(video_path)],
@@ -2138,7 +2138,7 @@ def generate_shorts(video_path: Path, clips: list[dict], transcript: dict,
         if snapped != clip["startTime"]:
             print(f"  ⏩ Clip start {clip['startTime']:.2f}s → {snapped:.2f}s (first word)")
             clip["startTime"] = snapped
-        # Stop exactly where the last word ends (+END_TAIL so it doesn't clip).
+        # Stop exactly where the last word ends (END_TAIL extra, 0 by default).
         snapped_end = snap_end_to_words(clip["endTime"], words)
         if snapped_end != clip["endTime"]:
             print(f"  ⏹ Clip end {clip['endTime']:.2f}s → {snapped_end:.2f}s (last word)")
