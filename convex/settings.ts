@@ -11,6 +11,7 @@ export const get = query({
       userId: v.id("users"),
       youtubeApiKey: v.optional(v.string()),
       openaiApiKey: v.optional(v.string()),
+      openaiModel: v.optional(v.string()),
       youtubeCookies: v.optional(v.string()),
       defaultLanguage: v.optional(v.string()),
       defaultShortDuration: v.optional(v.number()),
@@ -32,6 +33,7 @@ export const save = mutation({
   args: {
     youtubeApiKey: v.optional(v.string()),
     openaiApiKey: v.optional(v.string()),
+    openaiModel: v.optional(v.string()),
     youtubeCookies: v.optional(v.string()),
     defaultLanguage: v.optional(v.string()),
     defaultShortDuration: v.optional(v.number()),

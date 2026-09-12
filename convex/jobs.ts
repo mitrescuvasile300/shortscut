@@ -33,6 +33,11 @@ export const list = query({
       audioDownloadUrl: v.optional(v.string()),
       videoDownloadExpiry: v.optional(v.number()),
       error: v.optional(v.string()),
+      vpsPipelineId: v.optional(v.string()),
+      musicMode: v.optional(v.union(v.literal("none"), v.literal("default"), v.literal("custom"))),
+      musicStorageId: v.optional(v.id("_storage")),
+      musicFileName: v.optional(v.string()),
+      updatedAt: v.optional(v.number()),
     })
   ),
   handler: async (ctx) => {
@@ -77,6 +82,11 @@ export const get = query({
       audioDownloadUrl: v.optional(v.string()),
       videoDownloadExpiry: v.optional(v.number()),
       error: v.optional(v.string()),
+      vpsPipelineId: v.optional(v.string()),
+      musicMode: v.optional(v.union(v.literal("none"), v.literal("default"), v.literal("custom"))),
+      musicStorageId: v.optional(v.id("_storage")),
+      musicFileName: v.optional(v.string()),
+      updatedAt: v.optional(v.number()),
     }),
     v.null()
   ),
@@ -96,11 +106,17 @@ export const create = mutation({
     numShorts: v.number(),
     minDuration: v.number(),
     maxDuration: v.number(),
+    musicMode: v.optional(v.union(v.literal("none"), v.literal("default"), v.literal("custom"))),
+    musicStorageId: v.optional(v.id("_storage")),
+    musicFileName: v.optional(v.string()),
   },
   returns: v.id("jobs"),
   handler: async (ctx, args) => {
     const userId = await getAuthUserId(ctx);
     if (!userId) throw new Error("Not authenticated");
+    if (args.musicMode === "custom" && !args.musicStorageId) {
+      throw new Error("Încarcă un fișier audio pentru muzica de fundal");
+    }
 
     return await ctx.db.insert("jobs", {
       userId,
@@ -110,7 +126,21 @@ export const create = mutation({
       minDuration: args.minDuration,
       maxDuration: args.maxDuration,
       status: "pending",
+      musicMode: args.musicMode ?? "none",
+      musicStorageId: args.musicMode === "custom" ? args.musicStorageId : undefined,
+      musicFileName: args.musicMode === "custom" ? args.musicFileName : undefined,
     });
+  },
+});
+
+// Upload URL for a user-provided background music track
+export const generateMusicUploadUrl = mutation({
+  args: {},
+  returns: v.string(),
+  handler: async (ctx) => {
+    const userId = await getAuthUserId(ctx);
+    if (!userId) throw new Error("Not authenticated");
+    return await ctx.storage.generateUploadUrl();
   },
 });
 

@@ -12,7 +12,6 @@ import {
   Mic,
   Play,
   RefreshCw,
-  Server,
   Sparkles,
   Terminal,
   Video,
@@ -41,6 +40,28 @@ import {
 } from "@/lib/videoProcessor";
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
+
+/**
+ * Force a real file download. Storage URLs are cross-origin, so a plain
+ * `<a download>` is ignored by browsers (it just navigates to / opens the
+ * video). Fetch → Blob → object URL makes the download attribute work and
+ * lets us download several files one after another.
+ */
+async function downloadFile(url: string, fileName: string): Promise<void> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objectUrl;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // Give the browser a moment to start the download before revoking.
+  await new Promise((r) => setTimeout(r, 500));
+  URL.revokeObjectURL(objectUrl);
+}
 
 function formatSeconds(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -199,12 +220,14 @@ export function JobDetailPage() {
   const saveShort = useMutation(api.shorts.save);
   const markJobCompleted = useMutation(api.shorts.markJobCompleted);
   const refreshVideoUrl = useAction(api.processing.refreshVideoUrl);
-  const startProcessing = useAction(api.processing.processJob);
-  const startServerProcessing = useAction(api.serverProcessing.processJobOnServer);
+  // Runs the exact local script (shortscut_pipeline.py) on the VPS end-to-end.
+  const startProcessing = useAction(api.vpsPipeline.startPipeline);
+  const retryPull = useAction(api.vpsPipeline.retryPullForJob);
 
 
   const [processing, setProcessing] = useState(false);
   const [startingBackend, setStartingBackend] = useState(false);
+  const [isDownloadingAll, setIsDownloadingAll] = useState(false);
   const [serverProcessing, setServerProcessing] = useState(false);
   const serverModeRef = useRef(false);
   const [progress, setProgress] = useState<ProcessingProgress | null>(null);
@@ -382,7 +405,8 @@ export function JobDetailPage() {
       shorts.length === 0 &&
       !processing &&
       !autoGenerateTriggered.current &&
-      !serverModeRef.current
+      !serverModeRef.current &&
+      !job.vpsPipelineId // VPS pipeline renders the shorts itself
     ) {
       autoGenerateTriggered.current = true;
       console.log("[AutoGenerate] Starting automatic short generation...");
@@ -488,6 +512,17 @@ export function JobDetailPage() {
             </span>
             <span>•</span>
             <span>{job.language.toUpperCase()}</span>
+            {job.musicMode && job.musicMode !== "none" && (
+              <>
+                <span>•</span>
+                <span>
+                  🎵{" "}
+                  {job.musicMode === "custom"
+                    ? job.musicFileName || "muzică proprie"
+                    : "muzică inclusă"}
+                </span>
+              </>
+            )}
           </div>
         </div>
       </div>
@@ -503,12 +538,13 @@ export function JobDetailPage() {
               </div>
               <div>
                 <h3 className="text-lg font-bold mb-1">
-                  Procesează în Browser
+                  Procesează pe Server
                 </h3>
                 <p className="text-sm text-muted-foreground max-w-md">
-                  Totul se face automat: transcriere → analiză AI → face
-                  detection → crop 9:16 → subtitrări. Nu ai nevoie de nimic
-                  instalat.
+                  Rulează pe server exact scriptul local: download → Whisper →
+                  analiză AI → încadrare față / split-screen → tăiere tăceri →
+                  subtitrări → 1080x1920. Durează câteva minute; poți închide
+                  pagina.
                 </p>
               </div>
               <Button
@@ -539,67 +575,6 @@ export function JobDetailPage() {
                   <>
                     <Sparkles className="size-5 mr-2" />
                     Start Procesare
-                  </>
-                )}
-              </Button>
-            </div>
-          </div>
-
-          {/* Secondary: Process on Server */}
-          <div className="border border-blue-500/30 rounded-xl p-4 hover:bg-blue-500/5 transition-colors">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-3">
-                <Server className="size-5 text-blue-400" />
-                <div>
-                  <span className="text-sm font-medium">Procesează pe Server</span>
-                  <p className="text-xs text-muted-foreground">
-                    ffmpeg nativ pe VPS — fără limită de memorie, orice dimensiune video
-                  </p>
-                </div>
-              </div>
-              <Button
-                size="sm"
-                variant="outline"
-                className="border-blue-500/50 text-blue-400 hover:bg-blue-500/10"
-                disabled={startingBackend || serverProcessing}
-                onClick={async () => {
-                  if (!jobId) return;
-                  serverModeRef.current = true;
-                  setStartingBackend(true);
-                  try {
-                    // First trigger backend pipeline (transcribe + AI analysis)
-                    await startProcessing({ jobId: jobId as Id<"jobs"> });
-                    toast.info("Analiză completă — pornesc procesarea pe server...");
-                    // Now trigger VPS processing
-                    setServerProcessing(true);
-                    setStartingBackend(false);
-                    await startServerProcessing({ jobId: jobId as Id<"jobs"> });
-                    toast.success("Shorts-urile au fost generate pe server! 🎉");
-                  } catch (_err) {
-                    console.error("Server processing failed:", _err);
-                    const msg = _err instanceof Error ? _err.message : "Eroare necunoscută";
-                    toast.error(`Eroare procesare server: ${msg}`);
-                  } finally {
-                    setStartingBackend(false);
-                    setServerProcessing(false);
-                    serverModeRef.current = false;
-                  }
-                }}
-              >
-                {startingBackend ? (
-                  <>
-                    <Loader2 className="size-4 mr-1.5 animate-spin" />
-                    Analiză...
-                  </>
-                ) : serverProcessing ? (
-                  <>
-                    <Loader2 className="size-4 mr-1.5 animate-spin" />
-                    Procesare VPS...
-                  </>
-                ) : (
-                  <>
-                    <Server className="size-4 mr-1.5" />
-                    Start Server
                   </>
                 )}
               </Button>
@@ -733,6 +708,30 @@ export function JobDetailPage() {
         <div className="border border-destructive/30 bg-destructive/5 rounded-xl p-5">
           <h3 className="font-semibold text-destructive mb-1">Eroare</h3>
           <p className="text-sm text-destructive/80 mb-3">{job.error}</p>
+          {job.vpsPipelineId && (job.error || "").includes("nu a putut fi preluat") && (
+            <Button
+              size="sm"
+              className="mr-2"
+              disabled={startingBackend}
+              onClick={async () => {
+                if (!jobId) return;
+                setStartingBackend(true);
+                try {
+                  await retryPull({ jobId: jobId as Id<"jobs"> });
+                  toast.success("Se preiau shorturile de pe VPS...");
+                } catch (err) {
+                  toast.error(
+                    `Eroare: ${err instanceof Error ? err.message : "Eroare necunoscută"}`,
+                  );
+                } finally {
+                  setStartingBackend(false);
+                }
+              }}
+            >
+              <Download className="size-4 mr-1.5" />
+              Preia shorturile (fără reprocesare)
+            </Button>
+          )}
           <Button
             size="sm"
             variant="outline"
@@ -874,7 +873,21 @@ export function JobDetailPage() {
                                 </Badge>
                               )}
                             </div>
-                            <h3 className="font-semibold">{clip.title}</h3>
+                            <div className="flex items-start gap-2">
+                              <h3 className="font-semibold leading-snug">{clip.title}</h3>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-6 px-1.5 text-xs shrink-0"
+                                title="Copiază titlul pentru YouTube Shorts"
+                                onClick={e => {
+                                  e.stopPropagation();
+                                  copyToClipboard(clip.title, "Titlu");
+                                }}
+                              >
+                                <ClipboardCopy className="size-3" />
+                              </Button>
+                            </div>
                             <p className="text-sm text-muted-foreground mt-1 line-clamp-1">
                               {clip.reason}
                             </p>
@@ -910,10 +923,10 @@ export function JobDetailPage() {
                                         existingShort?.url ||
                                         generatedBlob?.url;
                                       if (!url) return;
-                                      const a = document.createElement("a");
-                                      a.href = url;
-                                      a.download = `${String(i + 1).padStart(2, "0")}_${clip.title.replace(/[^a-zA-Z0-9]/g, "_").substring(0, 30)}.mp4`;
-                                      a.click();
+                                      void downloadFile(
+                                        url,
+                                        `${String(i + 1).padStart(2, "0")}_${clip.title.replace(/[^a-zA-Z0-9]/g, "_").substring(0, 30)}.mp4`,
+                                      );
                                     }}
                                   >
                                     <Download className="size-3.5 mr-1" />
@@ -945,6 +958,38 @@ export function JobDetailPage() {
                             <blockquote className="text-sm italic border-l-2 border-primary/40 pl-3">
                               "{clip.hookLine || clip.transcriptExcerpt}"
                             </blockquote>
+                          </div>
+
+                          {/* YouTube Shorts title */}
+                          <div>
+                            <div className="flex items-center justify-between mb-1.5">
+                              <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+                                Titlu YouTube Shorts
+                              </div>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 text-xs"
+                                onClick={e => {
+                                  e.stopPropagation();
+                                  copyToClipboard(
+                                    clip.hashtags && clip.hashtags.length > 0
+                                      ? `${clip.title} ${clip.hashtags.slice(0, 2).join(" ")}`
+                                      : clip.title,
+                                    "Titlu",
+                                  );
+                                }}
+                              >
+                                <ClipboardCopy className="size-3 mr-1" />
+                                Copiază cu hashtag-uri
+                              </Button>
+                            </div>
+                            <p className="text-sm font-semibold bg-background rounded-lg p-3 border">
+                              {clip.title}
+                              <span className="ml-2 text-xs font-normal text-muted-foreground">
+                                {clip.title.length} caractere
+                              </span>
+                            </p>
                           </div>
 
                           {/* Caption */}
@@ -1023,19 +1068,25 @@ export function JobDetailPage() {
                   </div>
                   <Button
                     size="sm"
-                    onClick={() => {
-                      for (const short of shorts || []) {
-                        if (!short.url) continue;
-                        const a = document.createElement("a");
-                        a.href = short.url;
-                        a.download = short.fileName;
-                        a.click();
+                    disabled={isDownloadingAll}
+                    onClick={async () => {
+                      const list = (shorts || []).filter((s) => !!s.url);
+                      if (list.length === 0) return;
+                      setIsDownloadingAll(true);
+                      try {
+                        for (const short of list) {
+                          await downloadFile(short.url as string, short.fileName);
+                        }
+                        toast.success(`${list.length} shorts descărcate!`);
+                      } catch {
+                        toast.error("Descărcarea a eșuat. Încearcă din nou.");
+                      } finally {
+                        setIsDownloadingAll(false);
                       }
-                      toast.success("Descărcare inițiată!");
                     }}
                   >
                     <Download className="size-3.5 mr-1" />
-                    Descarcă Toate
+                    {isDownloadingAll ? "Se descarcă..." : "Descarcă Toate"}
                   </Button>
                 </div>
               </div>

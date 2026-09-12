@@ -1,6 +1,6 @@
 import { useMutation, useQuery } from "convex/react";
-import { ArrowLeft, Loader2, Sparkles } from "lucide-react";
-import { useState } from "react";
+import { ArrowLeft, Loader2, Music, Sparkles, Upload, X } from "lucide-react";
+import { useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -15,10 +15,12 @@ import {
 } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { api } from "../../convex/_generated/api";
+import type { Id } from "../../convex/_generated/dataModel";
 
 export function NewJobPage() {
   const navigate = useNavigate();
   const createJob = useMutation(api.jobs.create);
+  const generateMusicUploadUrl = useMutation(api.jobs.generateMusicUploadUrl);
   // User picks Browser or Server processing on the job detail page
   const settings = useQuery(api.settings.get);
 
@@ -30,6 +32,9 @@ export function NewJobPage() {
     settings?.defaultShortDuration || 300,
   ]);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [musicMode, setMusicMode] = useState<"none" | "default" | "custom">("none");
+  const [musicFile, setMusicFile] = useState<File | null>(null);
+  const musicInputRef = useRef<HTMLInputElement>(null);
 
   const isValidUrl =
     videoUrl.includes("youtube.com/") || videoUrl.includes("youtu.be/");
@@ -38,14 +43,34 @@ export function NewJobPage() {
     e.preventDefault();
     if (!isValidUrl || isSubmitting) return;
 
+    if (musicMode === "custom" && !musicFile) {
+      toast.error("Alege un fișier audio pentru muzica de fundal");
+      return;
+    }
+
     setIsSubmitting(true);
     try {
+      let musicStorageId: string | undefined;
+      if (musicMode === "custom" && musicFile) {
+        const uploadUrl = await generateMusicUploadUrl();
+        const res = await fetch(uploadUrl, {
+          method: "POST",
+          headers: { "Content-Type": musicFile.type || "application/octet-stream" },
+          body: musicFile,
+        });
+        if (!res.ok) throw new Error("upload failed");
+        musicStorageId = (await res.json()).storageId as string;
+      }
+
       const jobId = await createJob({
         videoUrl: videoUrl.trim(),
         language,
         numShorts,
         minDuration: durationRange[0],
         maxDuration: durationRange[1],
+        musicMode,
+        musicStorageId: musicStorageId as Id<"_storage"> | undefined,
+        musicFileName: musicFile?.name,
       });
 
       toast.success("Job creat! Alege modul de procesare.");
@@ -213,6 +238,80 @@ export function NewJobPage() {
               />
             </div>
           </div>
+        </div>
+
+        {/* Background music */}
+        <div className="space-y-3">
+          <Label className="text-base font-semibold">Muzică de fundal</Label>
+          <Select
+            value={musicMode}
+            onValueChange={v => {
+              setMusicMode(v as "none" | "default" | "custom");
+              if (v !== "custom") setMusicFile(null);
+            }}
+          >
+            <SelectTrigger className="h-11">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="none">🔇 Fără muzică (implicit)</SelectItem>
+              <SelectItem value="default">🎵 Muzică inclusă (royalty-free, volum redus)</SelectItem>
+              <SelectItem value="custom">📁 Încarc propriul fișier audio</SelectItem>
+            </SelectContent>
+          </Select>
+          {musicMode === "custom" && (
+            <div className="space-y-2">
+              <input
+                ref={musicInputRef}
+                type="file"
+                accept="audio/*,.mp3,.wav,.m4a,.aac,.ogg,.flac"
+                className="hidden"
+                onChange={e => {
+                  const f = e.target.files?.[0] ?? null;
+                  if (f && f.size > 50 * 1024 * 1024) {
+                    toast.error("Fișierul depășește 50 MB");
+                    e.target.value = "";
+                    return;
+                  }
+                  setMusicFile(f);
+                }}
+              />
+              {musicFile ? (
+                <div className="flex items-center gap-3 rounded-lg border bg-muted/40 px-3 py-2 text-sm">
+                  <Music className="size-4 text-primary shrink-0" />
+                  <span className="truncate flex-1">{musicFile.name}</span>
+                  <span className="text-muted-foreground text-xs">
+                    {(musicFile.size / 1024 / 1024).toFixed(1)} MB
+                  </span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="size-7"
+                    onClick={() => {
+                      setMusicFile(null);
+                      if (musicInputRef.current) musicInputRef.current.value = "";
+                    }}
+                  >
+                    <X className="size-4" />
+                  </Button>
+                </div>
+              ) : (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full h-11"
+                  onClick={() => musicInputRef.current?.click()}
+                >
+                  <Upload className="size-4 mr-2" />
+                  Alege fișier audio (mp3, wav, m4a… max 50 MB)
+                </Button>
+              )}
+              <p className="text-xs text-muted-foreground">
+                Piesa e pusă în buclă sub voce, la volum redus, cu fade in/out.
+              </p>
+            </div>
+          )}
         </div>
 
         {/* Submit */}
